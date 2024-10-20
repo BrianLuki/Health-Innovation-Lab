@@ -1,0 +1,1212 @@
+---
+title: "US EU clinical data"
+output: html_document
+date: "2024-09-24"
+---
+
+```{r}
+#install and load necessary packages
+#install.packages("stringdist")
+library(readr)
+library(tidyverse)
+library(jsonlite)
+library(stringr)
+library(stringdist)
+library(readxl)
+library(janitor)
+library(data.table)
+
+
+```
+
+# Loading and Clean the Datasets
+
+First, we load the dataset from both sources of EU and US database.  From both database, we want to extract the key variables, which are: 
+
+  Phase, # of patients, Start and end dates, disease, country, sponsor (firm), collaborators (firms/orgs), status (completion, termination)
+
+Finally we want to construct a  firm-disease-start_year-country panel
+
+## EU data
+
+### Import the Data
+
+```{r eval=FALSE}
+#Load the EU data
+# Initial dump
+# temp = read_csv("EU data/euctr_euctr_dump-2024-09-07-092059.csv")
+
+# Full EU dump
+#eu1 = lapply(list.files(path = "EU data/all_euctr", pattern = "*.csv", full.names = TRUE), read_csv)
+#eu1 = lapply(eu1, function(df) {
+#  df = df[ , !(names(df) %in% "trial_version")]  # Remove the "trial_version" column due to type discrepancy
+#  return(df)
+#})
+#eu1 = bind_rows(eu1) %>% 
+#  distinct(eudract_number_with_country, .keep_all = TRUE)
+#nrow(eu1)
+
+# Notice that the newest csv file(2024-10-05) in the whole folder contains all unique EU trials, I'm guessing this is because each dataset renewal is an update of all trials, with some addition of new trials.
+
+eu1 = read_csv("EU data/all_euctr/euctr_euctr_dump-2024-10-05-060856.csv")
+nrow(eu1)
+```
+
+```{r}
+#Exploratory code
+eu1 %>% select("trial_therapeutic_area")
+
+sum(is.na(eu1$"trial_term")&is.na(eu1$"trial_therapeutic_area"))/116815
+colnames(eu1)
+```
+
+Since the datasets consists more than 100 columns, we extract only the column with relevant informations, the mapping to the column name and the information is as follows: 
+
+  eudract_number_with_country - id
+  us_nct_clinicaltrials_gov_registry_number - nct_id
+  
+  sponsors - sponsors, collaborators
+  trial_term - disease
+  trial_therapeutic_area - disease
+  date_on_which_this_record_was_first_entered_in_the_eudract_data - start date
+  member_state_concerned - country
+  
+  trial_human_pharmacology_phase_i - phase 1
+  trial_therapeutic_exploratory_phase_ii - phase 2
+  trial_therapeutic_confirmatory_phase_iii - phase 3
+  trial_therapeutic_use_phase_iv - phase 4
+  subject_in_the_whole_clinical_trial - # of patients
+  trial_status - status
+  date_of_the_global_end_of_the_trial -  end date
+
+Notes: 
+  1. cannot find exact start date, use first record date instead
+  2. trial_therapeutic_area has 30% missing values, and trial_term has 20% missing values, together they have 12% missing values
+  
+### Clean the Data
+
+Now, we want to construct a dataset with only the mentioned columns
+
+```{r}
+#Select only the useful columns from the eu1 dataset
+eu2 = eu1 %>% select("eudract_number_with_country", "us_nct_clinicaltrials_gov_registry_number", "sponsors", "trial_term", "trial_therapeutic_area", "date_on_which_this_record_was_first_entered_in_the_eudract_data", "member_state_concerned", "trial_human_pharmacology_phase_i", "trial_therapeutic_exploratory_phase_ii", "trial_therapeutic_confirmatory_phase_iii", "trial_therapeutic_use_phase_iv", "subject_in_the_whole_clinical_trial", "trial_status", "date_of_the_global_end_of_the_trial")
+```
+
+
+#### sponsors, collaborators - sponsors
+
+```{r eval=FALSE}
+# Create columns name_of_sponsor, country, and name_of_organisation_providing_support from the sponsors column
+# Transfer the column sponsor to a data frame sponsors_df
+sponsors_df = data.frame()
+
+for (i in seq_along(eu2$sponsors)){
+  id = eu2$eudract_number_with_country[i]
+  observation = eu2$sponsors[i]
+  
+  if(observation == "[]"){     #observations with value "[]" (missing values) returns an empty list instead of a data frame with fromJSON()
+    sponsors_df = bind_rows(sponsors_df, fromJSON("[{}]") %>% mutate(id = id)) 
+  }else{
+    sponsors_df = bind_rows(sponsors_df, fromJSON(observation) %>% mutate(id = id))
+  }
+}
+
+# Select the columns needed from sponsors_df, including id, name_of_sponsor, and status_of_the_sponsor(which will later be used to determine if the sponsor is in industry or not)
+# Ignore organization providing support for now
+selected_sponsors_df = sponsors_df[, c("id", "name_of_sponsor", "status_of_the_sponsor")]
+
+# Combine selected_sponsors_df to eu2 and discard the column sponsor
+eu3 = left_join(selected_sponsors_df, eu2, by = c("id" = "eudract_number_with_country"))
+
+eu3 = eu3 %>% select(-"sponsors")
+
+# Also, change the column status_of_the_sponsor into another dummy variable column industry_dummy
+eu3 = eu3 %>% mutate(industry_dummy = case_when(
+  status_of_the_sponsor == "Commercial" ~ 1,
+  status_of_the_sponsor == "Non-Commercial" ~ 0,
+  )) %>% 
+  select(-"status_of_the_sponsor")
+
+```
+
+Note: 
+  1. Some observations have multiple sponsor information, some are duplicates and some are different sponsor information. What is the best solution? For now I use only the first one 
+  2. Whats the difference between sponsor and organization providing support?
+
+```{r}
+# Note: some observations have multiple sponsors, for now the values are stored in multiple_sponsors_per_obsv
+# Exploratory code
+multiple_sponsors_per_obsv = data.frame()
+
+for (observation in eu2$sponsors){
+  if (!is.null(nrow(fromJSON(observation))) && nrow(fromJSON(observation)) > 1){
+    multiple_sponsors_per_obsv = bind_rows(sponsors_df, fromJSON(observation))
+  }
+}
+
+head(multiple_sponsors_per_obsv, 100)
+
+# show the distribution of number of rows each JSON text converts to 
+temp = c()
+for (observation in eu2$sponsors){
+  temp = c(temp, nrow(fromJSON(observation)))
+}
+table(temp)
+```
+
+#### start_year, start_date, end_date
+
+Create `start_year`, `start_date` from `date_on_which_this_record_was_first_entered_in_the_eudract_data`,
+and `end_date` form `date_of_the_global_end_of_the_trial`
+
+```{r eval=FALSE}
+#Create variable start_year, start_date, end_date
+eu3 = eu3 %>% 
+  rename(start_date = date_on_which_this_record_was_first_entered_in_the_eudract_data) %>% 
+  mutate(start_year = year(start_date)) %>% 
+  rename(end_date = date_of_the_global_end_of_the_trial)
+```
+
+#### country
+
+Create the variable `country` base on `member_state_concerned`
+
+```{r}
+#Exam the values of member_state_concerned
+#table(eu3$member_state_concerned)
+
+#Notice every observation follows the form "country - agency" except Bulgaria
+#Change the observations with value "Bulgarian Drug Agency" into "Bulgaria - temp"
+eu4 = eu3 %>%
+  mutate(member_state_concerned = ifelse(member_state_concerned == "Bulgarian Drug Agency", "Bulgaria - temp", member_state_concerned))
+
+#Create variable country
+eu4 = eu4 %>% separate(member_state_concerned, into = c("country", "agency"), sep = " - ") %>% 
+  select(-"agency")
+```
+
+#### disease
+
+We want to create a column disease indicating the research area the clinical trial targets. The closest standardized variable is "trial_therapeutic_area", which we will be using the level 1 area code (CXX) to represent the disease.
+
+Note: These are the potential columns from eu1 that we can use, but none of these use mesh terms:
+"trial_medical_condition_s_being_investigated", "trial_term", "trial_medical_condition_in_easily_understood_language"
+
+```{r}
+#Create disease from trial_therapeutic_area
+eu5 = eu4 %>% 
+  mutate(disease_code = substr(trial_therapeutic_area, nchar(eu4$trial_therapeutic_area)-3,nchar(eu4$trial_therapeutic_area)-1)) %>% 
+  select(-trial_term, -trial_therapeutic_area) #remove trial_term and trial_therapeutic_area
+
+```
+
+
+#### (other variables)
+
+```{r}
+
+```
+
+
+#### change variable names
+
+Change `id` to `eudract_id`,
+`subject_in_the_whole_clinical_trial` to `patient_num`,
+`us_nct_clinicaltrials_gov_registry_number` to `nct_id`,
+`trial_human_pharmacology_phase_i` to `phase_1`,
+`trial_therapeutic_exploratory_phase_ii` to `phase_2`,
+`trial_therapeutic_confirmatory_phase_iii` to `phase_3`,
+`trial_therapeutic_use_phase_iv` to `phase_4`,
+`subject_in_the_whole_clinical_trial` to `patient_num`,
+`trial_status` to `status`,
+`name_of_sponsor` to `sponsor`
+
+```{r}
+#Code here 
+eu6 = eu5 %>% 
+  rename(
+    eudract_id = id,
+    patient_num = subject_in_the_whole_clinical_trial,
+    nct_id = us_nct_clinicaltrials_gov_registry_number,
+    phase_1 = trial_human_pharmacology_phase_i,
+    phase_2 = trial_therapeutic_exploratory_phase_ii,
+    phase_3 = trial_therapeutic_confirmatory_phase_iii,
+    phase_4 = trial_therapeutic_use_phase_iv,
+    status = trial_status,
+    sponsor = name_of_sponsor,
+  )
+```
+
+
+
+
+#### rearrange and group the data
+
+```{r}
+
+```
+
+
+Note: the classification of the area of study follows the MeSH tree classification, so for standardization we should use the browse_conditions table from AACT database, which also name their conditions based on MeSH tree classification.
+
+## US data
+
+### Import the Data
+
+```{r}
+#Load the US data sets, from the "Pipe-Delimited Files" from the AACT website with the most up-to-date version
+
+us_browse_conditions = read_csv("US data/delimited data/browse_conditions.txt")
+us_conditions = read_csv("US data/delimited data/conditions.txt")
+us_countries = read_csv("US data/delimited data/countries.txt")
+us_sponsors = read_csv("US data/delimited data/sponsors.txt")
+us_studies = read_csv("US data/delimited data/studies.txt")
+
+#Notice that the data set is only with one column with "|" separating the different variables
+#Separate the data into different variables in different columns
+
+us_browse_conditions = separate(us_browse_conditions, col = "id|nct_id|mesh_term|downcase_mesh_term|mesh_type", into = c("id", "nct_id", "mesh_term", "downcase_mesh_term", "mesh_type"), sep = "\\|")
+us_conditions = separate(us_conditions, col = "id|nct_id|name|downcase_name", into = c("id", "nct_id", "name", "downcase_name"), sep = "\\|")
+us_countries = separate(us_countries, col = "id|nct_id|name|removed", into = c("id", "nct_id", "name", "removed"), sep = "\\|")
+us_sponsors = separate(us_sponsors, col = "id|nct_id|agency_class|lead_or_collaborator|name", into = c("id", "nct_id", "agency_class", "lead_or_collaborator", "name"), sep = "\\|")
+us_studies = separate(us_studies, col = "nct_id|nlm_download_date_description|study_first_submitted_date|results_first_submitted_date|disposition_first_submitted_date|last_update_submitted_date|study_first_submitted_qc_date|study_first_posted_date|study_first_posted_date_type|results_first_submitted_qc_date|results_first_posted_date|results_first_posted_date_type|disposition_first_submitted_qc_date|disposition_first_posted_date|disposition_first_posted_date_type|last_update_submitted_qc_date|last_update_posted_date|last_update_posted_date_type|start_month_year|start_date_type|start_date|verification_month_year|verification_date|completion_month_year|completion_date_type|completion_date|primary_completion_month_year|primary_completion_date_type|primary_completion_date|target_duration|study_type|acronym|baseline_population|brief_title|official_title|overall_status|last_known_status|phase|enrollment|enrollment_type|source|limitations_and_caveats|number_of_arms|number_of_groups|why_stopped|has_expanded_access|expanded_access_type_individual|expanded_access_type_intermediate|expanded_access_type_treatment|has_dmc|is_fda_regulated_drug|is_fda_regulated_device|is_unapproved_device|is_ppsd|is_us_export|biospec_retention|biospec_description|ipd_time_frame|ipd_access_criteria|ipd_url|plan_to_share_ipd|plan_to_share_ipd_description|created_at|updated_at|source_class|delayed_posting|expanded_access_nctid|expanded_access_status_for_nctid|fdaaa801_violation|baseline_type_units_analyzed|patient_registry", into = unlist(strsplit("nct_id|nlm_download_date_description|study_first_submitted_date|results_first_submitted_date|disposition_first_submitted_date|last_update_submitted_date|study_first_submitted_qc_date|study_first_posted_date|study_first_posted_date_type|results_first_submitted_qc_date|results_first_posted_date|results_first_posted_date_type|disposition_first_submitted_qc_date|disposition_first_posted_date|disposition_first_posted_date_type|last_update_submitted_qc_date|last_update_posted_date|last_update_posted_date_type|start_month_year|start_date_type|start_date|verification_month_year|verification_date|completion_month_year|completion_date_type|completion_date|primary_completion_month_year|primary_completion_date_type|primary_completion_date|target_duration|study_type|acronym|baseline_population|brief_title|official_title|overall_status|last_known_status|phase|enrollment|enrollment_type|source|limitations_and_caveats|number_of_arms|number_of_groups|why_stopped|has_expanded_access|expanded_access_type_individual|expanded_access_type_intermediate|expanded_access_type_treatment|has_dmc|is_fda_regulated_drug|is_fda_regulated_device|is_unapproved_device|is_ppsd|is_us_export|biospec_retention|biospec_description|ipd_time_frame|ipd_access_criteria|ipd_url|plan_to_share_ipd|plan_to_share_ipd_description|created_at|updated_at|source_class|delayed_posting|expanded_access_nctid|expanded_access_status_for_nctid|fdaaa801_violation|baseline_type_units_analyzed|patient_registry", "\\|")), sep = "\\|")
+```
+
+Since the US data scatters in multiple datasets, here's the mapping from each datasets to the key variables they provide:
+
+  studies - start and end date, Phase, status, # of patients
+  browse_conditions - disease (MeSH)
+  conditions - disease
+  countries - country
+  sponsors - lead: sponsors, collaborators: collaborators
+  
+### Combine Datasets
+
+Here, we want to select only the useful variables from each dataset and combine them
+
+```{r}
+#Extract only the necessary column from each dataset
+
+#Select start_date, end_date, phase, status from us_studies, also select enrollment to compare to patient_num acquired from us_baseline_counts
+us_studies_reduced = us_studies %>% 
+  rename(end_date = completion_date, status = overall_status, patient_num = enrollment) %>% 
+  select(nct_id, start_date, end_date, phase, status, patient_num)
+
+#Collapse the different diseases for the same trial into one observation and select disease from us_conditions
+
+#use us_browse_conditions instead
+
+#us_conditions_reduced = us_conditions %>%
+#  rename(disease = downcase_name) %>% 
+#  group_by(nct_id) %>%
+#  summarize(disease = paste(unique(disease), collapse = ", ")) %>%
+#  ungroup() %>% 
+#  select(nct_id, disease)
+
+#Select country from us_countries
+#Note: what do we do if a trial has multiple country value
+us_countries_reduced = us_countries %>% 
+  rename(country = name) %>% 
+  distinct(nct_id, country)
+
+#Separate us_sponsors in to us_collaborator(collaborator) and us_sponsor(lead), and then select collaborator from us_collaborator and sponsors from us_sponsors
+us_collaborator = us_sponsors %>% filter(lead_or_collaborator == "collaborator")
+us_sponsor = us_sponsors %>% filter(lead_or_collaborator == "lead")
+
+us_collaborator_reduced = us_collaborator %>% 
+  rename(collaborator = name) %>% 
+  group_by(nct_id) %>%
+  summarize(collaborator = paste(unique(collaborator), collapse = ", ")) %>%
+  ungroup() %>% 
+  select(nct_id, collaborator)
+
+us_sponsor_reduced = us_sponsor %>% 
+  rename(sponsor = name) %>% 
+  mutate(industry_dummy = ifelse(agency_class == "INDUSTRY", 1, 0)) %>% 
+  select(nct_id, sponsor, industry_dummy)
+
+
+```
+
+
+```{r}
+#Combine the datasets into us1
+
+#Create a list consisting all datasets
+us_datasets = list(us_studies_reduced, us_conditions_reduced, us_countries_reduced, us_sponsor_reduced, us_collaborator_reduced)
+
+#Combine US datasets
+us1 = reduce(us_datasets, full_join, by = "nct_id")
+
+#Check the unique nct_id
+length(unique(us1$nct_id))
+```
+
+### Clean the Data
+
+#### phase_0, phase_1, phase_2, phase_3, phase_4
+
+Create phase_0, phase_1, phase_2, phase_3, phase_4 from phase
+
+```{r}
+#Create five one-hot coded variable for phase 0 through 4
+us1 = us1 %>% 
+  mutate(phase_0 = phase %in% c("EARLY_PHASE1")) %>% 
+  mutate(phase_1 = phase %in% c("PHASE1", "PHASE1/PHASE2")) %>%
+  mutate(phase_2 = phase %in% c("PHASE1/PHASE2", "PHASE2", "PHASE2/PHASE3")) %>%
+  mutate(phase_3 = phase %in% c("PHASE2/PHASE3", "PHASE3")) %>%
+  mutate(phase_4 = phase %in% c("PHASE4")) %>% 
+  select(-"phase")
+```
+
+#### start_year
+
+Create start_year from start_date
+
+```{r}
+#Convert start_date and end_date into type date
+us1 = us1 %>% 
+  mutate(start_date = as_date(start_date),
+         end_date = as_date(end_date)) %>% 
+  mutate(start_year = year(start_date))
+
+```
+
+#### disease
+
+To standardize disease, we will be using separate dataset us_browse_conditions which maps each unique US trials to multiple disease mesh terms. In order to map from the mesh terms to the mesh_code, we will be using the mesh_trees dataset. 
+
+Then, we create a dataset mapping each unique trial to one mesh_code by selecting the level 1 code with the most occurrences for each unique trials.
+
+
+```{r}
+#View us_browse_conditions to see the related area per nct_id
+us_browse_conditions = read_csv("US data/delimited data/browse_conditions.txt")
+
+us_browse_conditions = separate(us_browse_conditions, col = "id|nct_id|mesh_term|downcase_mesh_term|mesh_type", into = c("id", "nct_id", "mesh_term", "downcase_mesh_term", "mesh_type"), sep = "\\|")
+
+#There's multiple diseases per trial
+#Use the mesh_trees dataset to create mapping from nct_id to mesh_term to mesh_code which is a one-to-many relation
+mesh_trees = read_csv("US data/mesh_trees_2017.csv")
+```
+
+```{r}
+nct_id_mesh_term_disease_code = left_join(us_browse_conditions, mesh_trees, by = c("mesh_term" = "dscrptr")) %>% select(nct_id, mesh_term, tree2level)
+
+```
+
+```{r}
+# Exploratory code
+# Count amount of one-to-many relationship
+many_to_many_us_disease = nct_id_mesh_term_disease_code %>% 
+  group_by(nct_id, mesh_term) %>%
+  summarize(count = n()) %>% 
+  filter(count > 1)
+
+nrow(many_to_many_us_disease)
+```
+
+```{r}
+
+#Create a dataset nct_id_mesh_code mapping each unique nct_id to the level 1 mesh_code with the most occurrences 
+nct_id_mesh_term_disease_code = nct_id_mesh_term_disease_code %>% 
+  mutate(disease_code = substr(tree2level, 1, 3))
+
+nct_id_disease_code = data.frame()
+
+nct_id_disease_code = nct_id_mesh_term_disease_code %>% 
+  group_by(nct_id, disease_code) %>%  # Group by both nct_id and mesh_code
+  summarize(count = n()) %>%       # Count occurrences of each mesh_code per nct_id
+  ungroup() %>%                    # Ungroup to work with the data freely
+  group_by(nct_id) %>%             # Group by nct_id to find the most frequent mesh_code
+  filter(count == max(count)) %>%  # Filter the rows with the most frequent mesh_code
+  slice(1) %>%                     # In case of ties, take the first occurrence
+  select(nct_id, disease_code) 
+
+
+```
+
+Now, with the mapping dataset nct_id_mesh_code, we can create the column disease_code in the US dataset
+
+```{r}
+#Left join nct_id_disease_code to us1 so that each unique trial has a disease_code
+us2 = left_join(us1, nct_id_disease_code, by = "nct_id")
+
+#Note that 13.6% of US trials have missing value for disease_code
+sum(is.na(us2$disease_code)) / nrow(us2)
+
+```
+
+
+## Combine US&EU Data
+
+Note that the latest version of EU dataset is eu5, and the latest version of the US dataset is us1.
+Now, we want to select the columns needed for both datasets and combine them
+
+```{r}
+#Select the columns needed for both datasets (for now)
+eu7 = eu6 %>% 
+  rename(disease_code_eu = disease_code) %>% 
+  select("nct_id", "eudract_id", "sponsor", "industry_dummy", "country", "disease_code_eu", "start_year", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "end_date", "status")
+  
+us3 = us2 %>% 
+  rename(disease_code_us = disease_code) %>% 
+  mutate(patient_num = as.numeric(patient_num)) %>% 
+  select("nct_id", "sponsor", "industry_dummy", "country", "disease_code_us", "start_year", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "end_date", "status")
+
+#For trial in eu6 having nct_id, us the corresponding start_year from us2
+eu7 = eu7 %>%
+  left_join(us2 %>% distinct(nct_id, start_year), by = "nct_id", suffix = c("_eu", "_us")) %>%
+  mutate(start_year = coalesce(start_year_us, start_year_eu)) %>%
+  select(-start_year_us, -start_year_eu)
+
+```
+
+
+```{r}
+#Combine two datasets
+clinical_trials_1 = bind_rows(us3, eu7)
+
+```
+
+### Clean Variables
+
+#### disease
+
+What we have now is only disease_code, we also want to create disease_term based on the mesh_tree dataset, as well as creating an index for each disease_code.
+
+```{r}
+# Create column disease_code based on disease_code_eu and disease_code_us
+clinical_trials_1 = clinical_trials_1 %>% 
+  mutate(disease_code = coalesce(disease_code_eu, disease_code_us))
+
+#Create mapping from each disease_code to level 1 disease_term
+disease_code_to_term =  mesh_trees %>% 
+  filter(level == 1) %>% 
+  select(mesh_tree, dscrptr)
+
+#Map each disease_term to each disease_code in clinical_trials_2
+clinical_trials_2 = clinical_trials_1 %>% 
+  left_join(disease_code_to_term, by = c("disease_code" = "mesh_tree")) %>% 
+  rename(disease_term = dscrptr)
+
+```
+
+```{r}
+#Create a mapping from each disease_code to disease_id
+disease_code_to_id = clinical_trials_2 %>% 
+  distinct(disease_code) %>% 
+  arrange(disease_code) %>% 
+  mutate(disease_id = ifelse(is.na(disease_code), NA, row_number()))
+
+#Map each disease_index to each disease_code in clinical_trials_2
+clinical_trials_2 = clinical_trials_2 %>% 
+  left_join(disease_code_to_id, by = c("disease_code" = "disease_code"))
+```
+
+
+
+#### sponsor 
+
+We wish to standardize the companies by changing them all into lowercase and only keep the alphanumeric characters. In addition, we want to create an unique index for each companies, for companies names that belong to the same company but have slightly different names, we want them to share the same index. 
+
+We will be performing fuzzy match using the stringdist package.
+
+```{r}
+#Standardize sponsor, and then group and arrange the combined dataset
+clinical_trials_3 = clinical_trials_2 %>%
+  mutate(sponsor = str_to_lower(sponsor)) %>%  # Convert to lowercase
+  mutate(sponsor = str_replace_all(sponsor, "[^a-z0-9\\s]", "")) %>%  # Remove non-alphanumeric characters
+  mutate(sponsor = str_trim(sponsor)) %>% 
+  group_by(sponsor, disease_code, start_year, country) %>%
+  arrange(sponsor, disease_code, start_year) %>% 
+  ungroup %>% 
+  rename(sponsor_name = sponsor)
+```
+
+```{r}
+# Assign index to each unique sponsors, use Jaro-Winkler distance to determine if different sponsor names are the same organization
+
+# Following code from ChatGPT
+# Clean company suffixes
+suffixes = c("llc", "inc", "corp", "corporation", "limited", "co", "company", "ltd")
+
+clinical_trials_4 = clinical_trials_3 %>%
+  mutate(sponsor_name = str_remove_all(sponsor_name, paste0("\\b(", paste(suffixes, collapse = "|"), ")\\b"))) %>%
+  mutate(sponsor_name = str_trim(sponsor_name))
+
+# Function to calculate Jaro-Winkler distance in batches
+distance_matrix = function(company_names, batch_size = 1000, method = "jw") {
+  n = length(company_names)  # Get the total number of company names
+  dist_list = list()         # Create an empty list to store distance matrix chunks
+  
+  # Loop through the data in batches
+  for (i in seq(1, n, by = batch_size)) {
+    end = min(i + batch_size - 1, n)  # Define the end of the current batch
+    dist_chunk = stringdistmatrix(company_names[i:end], company_names, method = method)  # Calculate the distance
+    dist_list[[length(dist_list) + 1]] <- dist_chunk  # Store the chunk in the list
+  }
+  
+  # Combine the distance matrix chunks back together
+  dist_matrix = do.call(rbind, dist_list)
+  return(dist_matrix)
+}
+
+# Apply hierarchical clustering and assign indices based on the distance matrix
+assign_fuzzy_index = function(company_names, batch_size = 1000, method = "jw", cut_height = 0.08) {
+  # Get the distance matrix in batches
+  dist_matrix = distance_matrix(company_names, batch_size, method)
+  
+  # Perform hierarchical clustering
+  clusters = hclust(as.dist(dist_matrix))
+  
+  # Cut the dendrogram to define clusters
+  cluster_groups = cutree(clusters, h = cut_height)
+  
+  return(cluster_groups)  # Return the cluster group indices
+}
+```
+
+  Before we fuzzy match, we want to also match with the names in the firm_founding_year2 dataset, which is a list of companies with their year founded information. 
+  
+  We want to create a mapping list, firm_name_founding_year_id, which include all company names from clinical_trials_4 and firm_founding_year2, along with their unique matched id and the year_founded information from firm_founding_year2.
+  
+  Note that the hyperparamter cut_height has value 0.09 as a result of tuning in order to reach 90% distinctness for company names in firm_founding_year2 which is already unique.
+  
+```{r}
+# Load and Create firm_founding_year2
+# Load the company_found_year datasets and fix the formatting 
+biotech1 = row_to_names(read_excel("FoundingYear/biotech1.xls"), row_number = 2)
+biotech2 = row_to_names(read_excel("FoundingYear/biotech2.xls"), row_number = 2)
+biotech3 = row_to_names(read_excel("FoundingYear/biotech3.xls"), row_number = 2)
+pharma1 = row_to_names(read_excel("FoundingYear/pharma1.xls"), row_number = 2)
+pharma2 = row_to_names(read_excel("FoundingYear/pharma2.xls"), row_number = 2)
+pharma3 = row_to_names(read_excel("FoundingYear/pharma3.xls"), row_number = 2)
+pharma4 = row_to_names(read_excel("FoundingYear/pharma4.xls"), row_number = 2)
+
+#Combine all of the datasets into firm_founding_year
+datasets = list(biotech1, biotech2, biotech3, pharma1, pharma2, pharma3, pharma4)
+firm_founding_year1 = do.call(rbind, datasets) %>% distinct(`Excel Company ID`, .keep_all = TRUE)
+
+# Clean the company names and only select the useful columns
+firm_founding_year2 = firm_founding_year1 %>%
+  rename(company_name = `Company Name`) %>% 
+  rename(year_founded = `Year Founded`) %>% 
+  mutate(company_name = str_to_lower(company_name)) %>%  # Convert to lowercase
+  mutate(company_name = str_replace_all(company_name, "[^a-z0-9\\s]", "")) %>%  # Remove non-alphanumeric characters
+  mutate(company_name = str_remove_all(company_name, paste0("\\b(", paste(suffixes, collapse = "|"), ")\\b"))) %>%
+  mutate(company_name = str_trim(company_name))  %>% 
+  rename(sponsor_name = company_name) %>% 
+  mutate(year_founded = ifelse(year_founded == "-", NA, year_founded)) %>%
+  select(sponsor_name, year_founded) %>% 
+  filter(!is.na(year_founded)) # The purpose of this dataset is to map year_founded, so there's no need using observations without year_founded
+
+# 45437 companies in firm_founding_year2
+```
+
+```{r}
+# Exploratory code
+# Add unique id to all companies in firm_founding_year2 dataset
+# Apply the function to the company names
+# Note: Current cut_height = 0.2 (too high)
+# Try cut_height = 0.15 (too high)
+# Try cut_height = 0.1 (Slightly too high)
+# Try cut_height = 0.08
+# We want to tell 90% of the unique companies apart by their names
+
+#firm_founding_year3 = firm_founding_year2 %>%
+#  mutate(company_id = assign_fuzzy_index(company_name, batch_size = 1000))
+
+# firm_founding_year3 %>% arrange(desc(company_id))
+
+# XXX unique ids with 61697 unique names -> XXX percent accuracy
+```
+
+In firm_founding_year2, with cut_height = 0.08, we have 56573 unique ids with 61697 unique names -> 91.7 percent accuracy
+
+```{r eval=FALSE}
+# Create the mapping dataset firm_name_founding_year_id and perform fuzzy match to assign unique sponsor_id
+firm_name_founding_year_id = bind_rows(firm_founding_year2 %>% select(sponsor_name), clinical_trials_4 %>% select(sponsor_name)) %>%
+  distinct(sponsor_name) %>% 
+  left_join(firm_founding_year2, by = join_by(sponsor_name)) %>% 
+  arrange(sponsor_name)
+
+# This crashes, maybe split into two shorter dataset and fuzzy match each of them, then combine both dataset
+# the dataset has company in alphabetical order, and the companies start with J cuts off at 47222th observation, starting from 47223th observation the names start with K. 
+# We're going to fuzzy match row [1:47222] and [47223:96655] separately, with the wild assumption that there will be no overlapping companies in the two subgroups
+
+
+#firm_name_founding_year_id_first_half = firm_name_founding_year_id[1:47222, ] %>%
+#  mutate(sponsor_id = assign_fuzzy_index(sponsor_name, batch_size = 1000))
+
+#firm_name_founding_year_id_second_half = firm_name_founding_year_id[47223:96655, ] %>%
+#  mutate(sponsor_id = assign_fuzzy_index(sponsor_name, batch_size = 1000))
+
+
+
+# Saving the matched indexed files to prevent running again
+
+#write.csv(firm_name_founding_year_id_first_half, file = "firm_name_founding_year_id_first_half.csv")
+#write.csv(firm_name_founding_year_id_second_half, file = "firm_name_founding_year_id_second_half.csv")
+
+# Read in the saved csv files
+firm_name_founding_year_id_first_half = read_csv("firm_name_founding_year_id_first_half.csv")
+firm_name_founding_year_id_second_half = read_csv("firm_name_founding_year_id_second_half.csv")
+
+
+# Combine the two indexed dataset to the complete firm_name_founding_year_id, by shifting indeces from the firm_name_founding_year_id_second_half dataset
+
+firm_name_founding_year_id_first_half$sponsor_id %>% max() #The largest index in the first half is 43676, so the index of second half starts at 43677
+
+firm_name_founding_year_id = firm_name_founding_year_id_first_half %>% 
+  rbind(firm_name_founding_year_id_second_half %>% mutate(sponsor_id = 43676 + sponsor_id)) %>% 
+  distinct(sponsor_name, .keep_all = TRUE)
+```
+
+```{r eval=FALSE}
+# Old code with just clinical trial sponsors
+#Create dataset with unique sponsor_name
+#sponsor_name_id = clinical_trials_4 %>% 
+#  distinct(sponsor_name) %>% 
+#  filter(complete.cases(.))
+
+#Apply the function to the company names
+#sponsor_name_id = sponsor_name_id %>%
+#  mutate(sponsor_id = assign_fuzzy_index(sponsor_name, batch_size = 1000))
+
+```
+
+```{r}
+# We will use the full firm_name_founding_year_id later on
+# For now, map ONLY the sponsor_id to each sponsor_name in clinical_trials_4 from firm_name_founding_year_id
+# Rearrange the variable and rows
+sponsor_name_id = firm_name_founding_year_id %>% select(sponsor_name, sponsor_id) # only sponsor name and id
+
+
+clinical_trials_5 = clinical_trials_4 %>% 
+  left_join(sponsor_name_id, by = c("sponsor_name" = "sponsor_name")) %>% 
+  select("nct_id", "eudract_id", "sponsor_name", "industry_dummy", "sponsor_id", "disease_code", "disease_code_eu", "disease_code_us", "disease_term", "disease_id", "start_year",  "country", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "end_date", "status")
+```
+
+#### country
+
+Standardize country names
+
+```{r}
+# Create a mapping list from names of countries used in our dataset to distinct and non-repeating country names in the world
+# Load a list of all countries in the world, with another row distinct country
+countries = read_csv("Countries/countries.csv") %>% 
+  mutate(distinct_name = Country) %>% 
+  select(Country, distinct_name)
+
+# Extract the distinct list of names of countries in our dataset, then left join the list of countries from the previous step. Create a dataset distinct_country
+standardized_country = clinical_trials_5 %>% 
+  distinct(country) %>% 
+  arrange(country) %>% 
+  left_join(countries, by = c("country" = "Country")) 
+
+# Check the number of names of countries not in the distinct list
+standardized_country %>% filter(is.na(distinct_name)) # There are 46 names not in the distinct list
+
+# For each name of countries not having a distinct name, map them to an existing name or create a distinct name
+# Mapping based on research of region/country names 
+standardized_country = standardized_country %>% mutate(distinct_name = case_when(
+  !is.na(distinct_name) ~ distinct_name,
+  country == "Aland Islands" ~ "Finland",
+  country == "Antarctica" ~ "Antarctica",
+  country == "Antigua and Barbuda" ~ "Antigua and Barbuda",
+  country == "Bahamas" ~ "Bahamas",
+  country == "Bonaire, Sint Eustatius and Saba" ~ "Netherlands",
+  country == "Bosnia and Herzegovina" ~ "Bosnia and Herzegovina",
+  country == "Brunei Darussalam" ~ "Brunei Darussalam",
+  country == "CZECHIA" ~ "Czech Republic",
+  country == "Central African Republic" ~ "Central African Republic",
+  country == "Congo" ~ "Congo",
+  country == "Congo, The Democratic Republic of the" ~ "Congo",
+  country == "Czechia" ~ "Czech Republic",
+  country == "Côte D'Ivoire" ~ "Ivory Coast",
+  country == "Federated States of Micronesia" ~ "Federated States of Micronesia",
+  country == "Former Serbia and Montenegro" ~ "Former Serbia and Montenegro",
+  country == "Former Yugoslavia" ~ "Former Yugoslavia",
+  country == "Gambia" ~ "Gambia",
+  country == "Holy See (Vatican City State)" ~ "Vatican City State",
+  country == "Iran, Islamic Republic of" ~ "Iran",
+  country == "Korea, Republic of" ~ "South Korea",
+  country == "Kosovo" ~ "Kosovo",
+  country == "Lao People's Democratic Republic" ~ "Laos",
+  country == "Libyan Arab Jamahiriya" ~ "Libya",
+  country == "Macedonia, The Former Yugoslav Republic of" ~ "Macedonia",
+  country == "Moldova, Republic of" ~ "Moldova",
+  country == "Montenegro" ~ "Montenegro",
+  country == "Myanmar" ~ "Myanmar",
+  country == "North Macedonia" ~ "North Macedonia",
+  country == "Northern Mariana Islands" ~ "United States",
+  country == "Palestinian Territories, Occupied" ~ "Palestine",
+  country == "Palestinian Territory, occupied" ~ "Palestine",
+  country == "Russian Federation" ~ "Russia",
+  country == "Réunion" ~ "France",
+  country == "Saint Kitts and Nevis" ~ "Saint Kitts and Nevis",
+  country == "Saint Martin" ~ "Saint Martin",
+  country == "South Georgia and the South Sandwich Islands" ~ "United Kingdom",
+  country == "South Sudan" ~ "South Sudan",
+  country == "Syrian Arab Republic" ~ "Syria",
+  country == "The Democratic Republic of the Congo" ~ "Congo",
+  country == "Timor-Leste" ~ "Timor-Leste",
+  country == "Trinidad and Tobago" ~ "Trinidad and Tobago",
+  country == "UK" ~ "United Kingdom",
+  country == "United States Minor Outlying Islands" ~ "United States",
+  country == "Virgin Islands (U.S.)" ~ "United States"
+))
+
+```
+
+
+```{r}
+# Map the country values to the standardized names 
+clinical_trials_5 = clinical_trials_5 %>% 
+  left_join(standardized_country, by = "country") %>% 
+  mutate(country = distinct_name) %>% 
+  select(-distinct_name)
+
+```
+
+
+We want to also add an index for countries
+
+```{r}
+# Create column country_id 
+# Create a mapping from each country to country_id
+country_name_to_id = clinical_trials_5 %>% 
+  distinct(country) %>% 
+  arrange(country) %>% 
+  mutate(country_id = ifelse(is.na(country), NA, row_number()))
+
+#Map each disease_index to each disease_code in clinical_trials_2
+clinical_trials_6 = clinical_trials_5 %>% 
+  left_join(country_name_to_id, by = "country") %>% 
+  select("nct_id", "eudract_id", "sponsor_name", "industry_dummy", "sponsor_id", "disease_code", "disease_code_eu", "disease_code_us", "disease_term", "disease_id", "start_year",  "country", "country_id", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "end_date", "status")
+```
+
+#### status
+
+```{r}
+# Look at the distinct values of status
+#clinical_trials_6 %>% distinct(status)
+
+# reclassify the statuses into "ongoing", "completed", "terminated", and "" for invalid input
+# Classification might be subject to change 
+clinical_trials_6 = clinical_trials_6 %>% mutate(status = case_when(
+  status %in% c("Ongoing", "NOT_YET_RECRUITING", "ACTIVE_NOT_RECRUITING", "RECRUITING", "ENROLLING_BY_INVITATION") ~ "ongoing",
+  status %in% c("Completed", "COMPLETED", "APPROVED_FOR_MARKETING") ~ "completed",
+  status %in% c("TERMINATED", "WITHDRAWN", "Prematurely Ended", "Trial now transitioned", "Restarted", "Temporarily Halted", "SUSPENDED", "Prohibited by CA", "Suspended by CA", "WITHHELD") ~ "terminated",
+  TRUE ~ ""
+)) 
+
+# 81702/865051 trials have invalid status value
+```
+#### Note: Classification might be subject to change 
+
+
+### Change NA values to blank, TRUE/FALSE to 1/0
+
+```{r}
+# Change NA values to blank, TRUE/FALSE to 1/0, also change end_data to end_year
+
+clinical_trials_7 = clinical_trials_6 %>% 
+  mutate(nct_id = ifelse(is.na(nct_id), "", nct_id)) %>% 
+  mutate(eudract_id = ifelse(is.na(eudract_id), "", eudract_id)) %>% 
+  mutate(sponsor_name = ifelse(is.na(sponsor_name), "", sponsor_name)) %>% 
+  mutate(industry_dummy = ifelse(is.na(industry_dummy), "", industry_dummy)) %>% 
+  mutate(sponsor_id = ifelse(is.na(sponsor_id), "", sponsor_id)) %>% 
+  mutate(disease_code = ifelse(is.na(disease_code), "", disease_code)) %>% 
+  mutate(disease_code_eu = ifelse(is.na(disease_code_eu), "", disease_code_eu)) %>% 
+  mutate(disease_code_us = ifelse(is.na(disease_code_us), "", disease_code_us)) %>% 
+  mutate(disease_term = ifelse(is.na(disease_term), "", disease_term)) %>% 
+  mutate(disease_id = ifelse(is.na(disease_id), "", disease_id)) %>% 
+  mutate(start_year = ifelse(is.na(start_year), "", start_year)) %>% 
+  mutate(country = ifelse(is.na(country), "", country)) %>% 
+  mutate(country_id = ifelse(is.na(country_id), "", country_id)) %>% 
+  mutate(patient_num = ifelse(is.na(patient_num), "", patient_num)) %>%
+  mutate(end_year = ifelse(is.na(end_date), "", year(end_date))) %>% 
+  select(-end_date) %>% 
+  mutate(phase_1 = ifelse(phase_1 == TRUE, 1, 0)) %>% 
+  mutate(phase_2 = ifelse(phase_2 == TRUE, 1, 0)) %>% 
+  mutate(phase_3 = ifelse(phase_3 == TRUE, 1, 0)) %>% 
+  mutate(phase_4 = ifelse(phase_4 == TRUE, 1, 0)) 
+
+
+```
+
+### Remove Duplicates
+
+We want to remove the duplicates observations. First, we check them on the sponsor, country, nct_id, eudract_id level, then we look for EU trials also recorded in US dataset
+
+```{r}
+# Frist, check at the sponsor, country, nct_id, eudract_id level, since we have different trials with the same nct_id due to country, and different trials with the same eudract_id due to sponsor
+clinical_trials_7 %>% 
+  group_by(sponsor_id, country_id, nct_id, eudract_id) %>% 
+  count() %>% 
+  nrow()
+```
+
+```{r}
+# Notice that there are 863042 unique trials where there are 865051 rows, we remove these obvious duplicates first
+clinical_trials_8 = clinical_trials_7 %>% 
+  distinct(sponsor_id, country_id, nct_id, eudract_id, .keep_all=TRUE)
+
+# We reduced 2009 duplicates
+```
+
+Moving on, we want to make sure there's no overlap in EU data and the US data, on the sponsor-disease-start_year-country level.
+First, we single out a subset, eu_with_nct_id, with trials in EU data that has an nct_id (potentially in US data).
+Then, we remove the eudract_id in eu_with_nct_id, and also remove this subset from clinical_trials_7.
+Lastly, we select the unique trials on the nct_id-sponsor-disease-start_year-country level.
+
+```{r}
+# Create subset, eu_with_nct_id
+eu_with_nct_id = clinical_trials_8 %>% 
+  filter(nct_id != "") %>% 
+  filter(eudract_id != "")
+
+# Remove eu_with_nct_id from clinical_trials_8
+clinical_trials_9 = clinical_trials_8 %>% 
+  anti_join(eu_with_nct_id, by = names(eu_with_nct_id))
+
+# Erase the eudract_id in eu_with_nct_id to "impersonate" a US trial
+eu_with_nct_id = eu_with_nct_id %>% mutate(eudract_id = "")
+
+# Add the modified eu_with_nct_id back to clinical_trials_8 and select unique trials on the nct_id-eudract_id-sponsor-disease-start_year-country level
+# Note we also want to include eudract_id because we might mistake distinct trials with missing values in other variables as the same trial
+clinical_trials_9 = clinical_trials_9 %>% 
+  bind_rows(eu_with_nct_id) %>% 
+  distinct(nct_id, eudract_id, sponsor_id, disease_id, start_year, country_id, .keep_all=TRUE)
+
+# We reduced 3958 duplicates
+
+```
+
+## Construct datasets for easier use
+
+### main_raw_dataset, trial_country_dataset, trial_disease_firm_dataset
+
+```{r}
+# rearrange the trials and assign a unique id to them, call the dataset main_raw_dataset
+main_raw_dataset = clinical_trials_9 %>% 
+  group_by(sponsor_name, disease_id, start_year) %>% 
+  arrange(sponsor_name, disease_id, start_year, country_id) %>% 
+  ungroup() %>% 
+  mutate(trial_id = row_number())
+
+main_raw_dataset = main_raw_dataset %>% 
+  select(trial_id, names(main_raw_dataset))
+
+# fix one minor sponsor name error for one observation
+main_raw_dataset = main_raw_dataset %>% mutate(sponsor_name = ifelse(sponsor_name == "department of \ngynaecology helse finnmark klinikk \nhammerfest", "department of gynaecology helse finnmark klinikk hammerfest", sponsor_name)) 
+
+
+# Create trial_country_dataset and trial_disease_firm_dataset from main_raw_dataset
+trial_country_dataset = main_raw_dataset %>% 
+  select(trial_id, nct_id, eudract_id, country, country_id)
+
+trial_disease_firm_dataset = main_raw_dataset %>% 
+  select(trial_id, nct_id, eudract_id, sponsor_name, industry_dummy, sponsor_id, disease_code, disease_code_eu, disease_code_us, disease_term, disease_id, start_year, phase_1, phase_2, phase_3, phase_4, patient_num, end_year, status)
+
+
+```
+
+
+### firm_year_dataset
+
+#### Create trial_firm_detail 
+
+Use main_raw_dataset as a starting point, create a dataset firm_year_dataset with unit of analysis being firm(sponsor) and year.
+Recall in the "sponsor" section in "Combine US&EU Data", we have a dataset, firm_name_founding_year_id, with all company names, company ids, and year founded for some of the companies.
+
+```{r}
+# Create dataset trial_firm_detail
+# map year_founded to each company id in main_raw_dataset (with selected rows)
+trial_firm_detail_1 = main_raw_dataset %>% 
+  left_join(firm_name_founding_year_id %>% 
+              mutate(sponsor_found_year = ifelse(is.na(year_founded), "", year_founded)) %>% 
+              select(sponsor_name, sponsor_found_year), by = "sponsor_name") %>% 
+  select(trial_id, sponsor_name, sponsor_id, sponsor_found_year, start_year, country, phase_1, phase_2, phase_3, phase_4, patient_num, status, end_year, industry_dummy) %>% 
+  mutate(sponsor_found_year = ifelse(is.na(sponsor_found_year), "", sponsor_found_year))
+
+
+# create variable matched_capiq indicating the company matched their founded year from firm_name_founding_year_id
+trial_firm_detail_1 = trial_firm_detail_1 %>% 
+  mutate(matched_capiq = ifelse(sponsor_found_year == "", 0, 1))
+
+
+#Exploratoy code
+trial_firm_detail_1 %>% distinct(sponsor_id, .keep_all = TRUE) %>% filter(sponsor_found_year == "")
+
+# Note that 47897 out of 51343 sponsors in the trials dataset do not have a sponsor_found_year value, 93%, too high
+# perhaps we can increase cut_height from fuzzy match to better match companies from firm_founding_year2 to clinical_trials_4
+# but this may mix up different companies very bad since cut_height = 0.8 is already mixing up some companies
+```
+
+  As we joined sponsor_found_year to the main_raw_dataset, we found an issue. With the fuzzy matched method we used, we sometimes mistaken two different companies as the same one because their name is similar, and there's no way to verify this. However, with the comprehensiveness of firm_name_founding_year_id, we notice there are some companies with the same sponsor_id, but some being matched with a sponsor_found_year and some doesn't. Essentially this means the dataset is helping us point out *some* of the miss-fuzzy-matched companies, so we assign these "problematic" sponsor_ids with new ids, and append them to the bottom of the trial_firm_detail_1 dataset.
+
+```{r}
+# Identify the mismatched sponsor_id thanks to the founded year dataset
+mismatched_sponsor_id = trial_firm_detail_1 %>% 
+  distinct(sponsor_id, sponsor_found_year, .keep_all = TRUE) %>% 
+  group_by(sponsor_id) %>% 
+  count() %>% 
+  filter(n != 1) %>% 
+  select(sponsor_id)
+
+# Assign these mismatched companies new id
+corrected_mismatched_sponsor_id = trial_firm_detail_1 %>% distinct(sponsor_id, sponsor_found_year, .keep_all = TRUE) %>% 
+  filter(sponsor_id %in% mismatched_sponsor_id$sponsor_id) %>% 
+  arrange(sponsor_id) %>% 
+  mutate(correct_sponsor_id = as.character(row_number() + max(as.numeric(trial_firm_detail_1$sponsor_id), na.rm = TRUE))) %>% 
+  select(sponsor_name, correct_sponsor_id)
+  
+
+# Update the corrected sponsor_id of trial_firm_detail_1
+trial_firm_detail_2 = trial_firm_detail_1 %>% 
+  left_join(corrected_mismatched_sponsor_id, by = "sponsor_name") %>% 
+  mutate(sponsor_id = ifelse(is.na(correct_sponsor_id), sponsor_id, correct_sponsor_id)) %>% 
+  select(-correct_sponsor_id)
+
+```
+
+#### Define valid trials
+
+Before we complete the construction of the datsset, which includes a lot of interation between variables, we want to set definitions of what defines a "valid" observation, here;s how I can think of to define a "valid" trial:
+
+ - A trial needs to have a valid sponsor name
+ - A trial needs to have at least one phase
+ - A trial needs to have a start year
+ - A trial's start year cannot be earlier than its sponsor's founded year
+ - Since the scope of this project is up to 2024, any end_year after 2024 will be dropped
+ - A trial not having an end_year:
+   - if the status is "completed" or "terminated", then the trial should be discarded
+   - if the status is missing, we assume the trial is still ongoing
+ - A trial having an end year but not a status will be *exclude* (considered completed or terminated?)
+ 
+Additionally, for companies missing sponsor_found_year, we will use their earliest trial start year as their founded year
+
+```{r}
+# Trim the dataset based on the aforementioned rules
+trial_firm_detail_3 = trial_firm_detail_2 %>% # 859441
+  filter(sponsor_name != "") %>% # 859207
+  filter(!(phase_1 == 0 & phase_2 == 0 & phase_3 == 0 & phase_4 == 0)) %>% # 507585, big cut
+  filter(start_year != "") %>% # 505039
+  filter(start_year > sponsor_found_year) %>% # 500949
+  mutate(end_year = ifelse(end_year > "2024", "", end_year)) %>% 
+  filter(!(end_year == "" & (status == "completed" | status == "terminated"))) %>% # 339522, big cut
+  mutate(status = ifelse(status == "" & end_year == "", "ongoing", ifelse(status == "", "completed", status)))
+
+
+# fill in sponsor_found_year with minimum start_year
+trial_firm_detail_3 = trial_firm_detail_3 %>%
+  group_by(sponsor_id) %>%
+  mutate(sponsor_found_year = ifelse(sponsor_found_year == "", min(start_year, na.rm = TRUE), sponsor_found_year)) %>% 
+  ungroup() %>% 
+  mutate(sponsor_id = as.numeric(sponsor_id))
+  
+
+# exploratory code
+unmatched_companies_with_industry_dummy = trial_firm_detail_3 %>% distinct(sponsor_id, .keep_all = TRUE) %>% select(sponsor_name, sponsor_id, matched_capiq, industry_dummy) %>% filter(matched_capiq == 0)
+
+18271/25529 # of all companies not matching are academic
+```
+
+#### Consturct firm_year_dataset
+
+  Construct the firm_year_dataset from trial_firm_detail sponsor-year panel
+
+```{r}
+# Create variable year, which spans from founded year to 2024 for each company
+firm_year_dataset_1 = trial_firm_detail_3 %>% 
+  distinct(sponsor_id, sponsor_found_year, .keep_all = TRUE) %>% 
+  select(sponsor_id, sponsor_name, sponsor_found_year) %>% 
+  rowwise() %>%
+  mutate(year = list(seq(sponsor_found_year, 2024))) %>%
+  unnest(year) %>% 
+  select(-sponsor_found_year) %>% 
+  mutate(year = as.character(year))
+
+```
+
+  Create 12 columns tracking number of phase 1 to 4 trials starting, completing, or terminating throughout the years
+
+```{r}
+# phase 1 start, complete, terminate
+phase_1_start = trial_firm_detail_3 %>% 
+  filter(phase_1 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_1_start = n(), .groups = 'drop') 
+
+phase_1_complete = trial_firm_detail_3 %>% 
+  filter(status == "completed") %>% 
+  filter(phase_1 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_1_complete = n(), .groups = 'drop') 
+
+phase_1_terminate = trial_firm_detail_3 %>% 
+  filter(status == "terminated") %>% 
+  filter(phase_1 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_1_terminate = n(), .groups = 'drop') 
+
+
+# phase 2 start, complete, terminate
+phase_2_start = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_2_start = n(), .groups = 'drop') 
+
+phase_2_complete = trial_firm_detail_3 %>% 
+  filter(status == "completed") %>% 
+  filter(phase_2 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_2_complete = n(), .groups = 'drop') 
+
+phase_2_terminate = trial_firm_detail_3 %>% 
+  filter(status == "terminated") %>% 
+  filter(phase_2 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_2_terminate = n(), .groups = 'drop') 
+
+
+# phase 3 start, complete, terminate
+phase_3_start = trial_firm_detail_3 %>% 
+  filter(phase_3 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_3_start = n(), .groups = 'drop') 
+
+phase_3_complete = trial_firm_detail_3 %>% 
+  filter(status == "completed") %>% 
+  filter(phase_3 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_3_complete = n(), .groups = 'drop') 
+
+phase_3_terminate = trial_firm_detail_3 %>% 
+  filter(status == "terminated") %>% 
+  filter(phase_3 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_3_terminate = n(), .groups = 'drop') 
+
+
+# phase 4 start, complete, terminate
+phase_4_start = trial_firm_detail_3 %>% 
+  filter(phase_4 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_4_start_ = n(), .groups = 'drop') 
+
+phase_4_complete = trial_firm_detail_3 %>% 
+  filter(status == "completed") %>% 
+  filter(phase_4 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_4_complete = n(), .groups = 'drop') 
+
+phase_4_terminate = trial_firm_detail_3 %>% 
+  filter(status == "terminated") %>% 
+  filter(phase_4 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_4_terminate = n(), .groups = 'drop') 
+
+firm_year_dataset_2 = firm_year_dataset_1 %>% 
+  left_join(phase_1_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_1_complete, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_1_terminate, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_2_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_2_complete, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_2_terminate, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_3_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_3_complete, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_3_terminate, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_4_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>%
+  left_join(phase_4_complete, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_4_terminate, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  mutate(across(everything(), ~ replace_na(., 0)))
+
+```
+
+# Create the EU exposure variables
+
+any_eu_pre_2016: coded as 1 if a company has at least 1 trial in GDPR affected countries (EU countries) before 2016
+above_median_eu_pre_2016: 
+
+Note: We have missing values for country
+
+```{r}
+# Add the column any_eu_pre_2016 and above_median_eu_pre_2016 to firm_year_dataset_2
+eu_countries = c("Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus", "Czech Republic", "Denmark", "Estonia", "Finland", "France", "Germany", "Greece", "Hungary", "Ireland", "Italy", "Latvia", "Lithuania", "Luxembourg", "Malta", "Netherlands", "Poland", "Portugal", "Romania", "Slovakia", "Slovenia", "Spain", "Sweden", "United Kingdom")   # Should we include UK since UK is in EU before 2016
+
+eu_expose_pre_2016 = trial_firm_detail_3 %>% 
+  filter(start_year < "2016") %>% 
+  mutate(any_eu_pre_2016 = ifelse(country %in% eu_countries, 1, 0)) %>% 
+  group_by(sponsor_id) %>% 
+  summarise(eu_porp_pre_2016 = mean(any_eu_pre_2016), # calculate proportion of eu trials
+            any_eu_pre_2016 = max(any_eu_pre_2016)) # 1 if any trial is in EU) 
+
+
+eu_prop_median = median(eu_expose_pre_2016$eu_porp_pre_2016) # Calculate the median of EU proportion
+
+eu_expose_pre_2016 = eu_expose_pre_2016 %>% 
+  mutate(above_median_eu_pre_2016 = ifelse(eu_porp_pre_2016>eu_prop_median, 1, 0)) %>% # 1 if EU proportion > median
+  select(-eu_porp_pre_2016)
+
+firm_year_dataset_3 = firm_year_dataset_2 %>% 
+  left_join(eu_expose_pre_2016, by = "sponsor_id") %>% 
+  mutate(any_eu_pre_2016 = ifelse(is.na(any_eu_pre_2016), 0, 1)) %>%  # Notice companies founded after 2016 wil have NA values
+  mutate(above_median_eu_pre_2016 = ifelse(is.na(above_median_eu_pre_2016), 0, 1))
+
+
+
+
+# Use this code to obtain exposure on company level, independent of time
+firm_year_dataset_3 %>% distinct(sponsor_id, any_eu_pre_2016, above_median_eu_pre_2016, .keep_all = TRUE) %>% 
+  select(sponsor_id, sponsor_name, any_eu_pre_2016, above_median_eu_pre_2016)
+
+firm_year_dataset_3 %>% filter(sponsor_id == "21373")
+```
+
+
+## Export Datasets (Checkpoint)
+
+```{r}
+# Create csv files storing main_raw_dataset, trial_country_dataset, and trial_disease_firm_dataset
+write.csv(main_raw_dataset, file = "main_raw_dataset.csv")
+write.csv(trial_country_dataset, file = "trial_country_dataset.csv")
+write.csv(trial_disease_firm_dataset, file = "trial_disease_firm_dataset.csv")
+
+# Create cvs files with unique company_id and unique country names and id
+write.csv(trial_firm_detail_2, file = "trial_firm_detail_2.csv")
+write.csv(unmatched_companies_with_industry_dummy, file = "unmatched_companies_with_industry_dummy.csv")
+write.csv(firm_year_dataset_3, file = "firm_year_dataset_3.csv")
+
+```
+
+
+
+
+# Questions and Notes
+
+  1. Still have to add patient number/average for firm_year_dataset_3, confirm cumulative or not
+  2. 93% of the companies did not match with a founding year, don't think it's cut_height issue since current cut_height value is already mixing up company names. Guessing might be two datasets low overlap.
+  3. Country/ Sponsor description? Is it a separate dataset? (add 3 columns that count # of trials from EU / US data and also the total (# of trials per sponsor and country))
+  
+  
+# Task
+
+ 1. different cut_height for companies start with number and letter
+ 2. maybe discard companies with on ly one trial
+ 3. fix filtering in trial_firm_detail
+ 4. add industry_dummy for firm_year_data, maybe drop academic in the future
+ 5. send csv of unmatched_dummy with industry dummy variable, and firm_year_data
+ 6. For the firm/year panel, let's also include # of us-based trials and # of EU-based trials (per each phase) per firm/year.  Basically, this will be # of phase I, 2, 3 trials but based on where the country for that trial is (EU or US). If neither US or EU, maybe we can create separate counts too.
+ 
+
+  
+
+
+
+
+
+
