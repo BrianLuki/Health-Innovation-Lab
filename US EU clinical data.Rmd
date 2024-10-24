@@ -985,9 +985,10 @@ Before we complete the construction of the datsset, which includes a lot of inte
  - A trial not having an end_year:
    - if the status is "completed" or "terminated", then the trial should be discarded
    - if the status is missing, we assume the trial is still ongoing
- - A trial having an end year but not a status will be *exclude* (considered completed or terminated?)
+ - A trial having an end year but not a status will be excluded
  
-Additionally, for companies missing sponsor_found_year, we will use their earliest trial start year as their founded year
+For companies missing sponsor_found_year, we will use their earliest trial start year as their founded year.
+Additionally, we want to add a region classifier, taking values from "EU", "US", or "Others"
 
 ```{r}
 # Trim the dataset based on the aforementioned rules
@@ -997,8 +998,9 @@ trial_firm_detail_3 = trial_firm_detail_2 %>% # 859441
   filter(start_year != "") %>% # 505039
   filter(start_year > sponsor_found_year) %>% # 500949
   mutate(end_year = ifelse(end_year > "2024", "", end_year)) %>% 
-  filter(!(end_year == "" & (status == "completed" | status == "terminated"))) %>% # 339522, big cut
-  mutate(status = ifelse(status == "" & end_year == "", "ongoing", ifelse(status == "", "completed", status)))
+  filter(!(end_year == "" & (status == "completed" | status == "terminated"))) %>% # 465334, big cut
+  mutate(status = ifelse(status == "" & end_year == "", "ongoing", status)) %>% 
+  filter(!(status == "" & !(end_year == ""))) # 444917
 
 
 # fill in sponsor_found_year with minimum start_year
@@ -1014,6 +1016,17 @@ unmatched_companies_with_industry_dummy = trial_firm_detail_3 %>% distinct(spons
 
 18271/25529 # of all companies not matching are academic
 ```
+```{r}
+# Create the region variable
+eu_countries = c("Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus", "Czech Republic", "Denmark", "Estonia", "Finland", "France", "Germany", "Greece", "Hungary", "Ireland", "Italy", "Latvia", "Lithuania", "Luxembourg", "Malta", "Netherlands", "Poland", "Portugal", "Romania", "Slovakia", "Slovenia", "Spain", "Sweden", "United Kingdom") 
+
+trial_firm_detail_3 = trial_firm_detail_3 %>% mutate(region = case_when(
+  country == "United States" ~ "US",
+  country %in% eu_countries ~ "EU",
+  TRUE ~ "Others"
+))
+```
+
 
 #### Consturct firm_year_dataset
 
@@ -1023,7 +1036,7 @@ unmatched_companies_with_industry_dummy = trial_firm_detail_3 %>% distinct(spons
 # Create variable year, which spans from founded year to 2024 for each company
 firm_year_dataset_1 = trial_firm_detail_3 %>% 
   distinct(sponsor_id, sponsor_found_year, .keep_all = TRUE) %>% 
-  select(sponsor_id, sponsor_name, sponsor_found_year) %>% 
+  select(sponsor_id, sponsor_name, sponsor_found_year, industry_dummy) %>% 
   rowwise() %>%
   mutate(year = list(seq(sponsor_found_year, 2024))) %>%
   unnest(year) %>% 
@@ -1032,97 +1045,211 @@ firm_year_dataset_1 = trial_firm_detail_3 %>%
 
 ```
 
-  Create 12 columns tracking number of phase 1 to 4 trials starting, completing, or terminating throughout the years
+  For each phase, create phase_x_start, phase_x_start_eu, phase_x_start_us, phase_x_start_others, which covers overall and regional start information. As for end date, create phase_x_enddate_comp, phase_x_enddate_term, phase_x_startdate_comp, phase_x_startdate_term, pointing out the end date and the start date of complete/terminated trials.
+  
+  This would create 8 column per trials, total 32 columnd.
 
 ```{r}
-# phase 1 start, complete, terminate
+# phase 1 start, start_eu, start_us, start_others, complete, terminate
 phase_1_start = trial_firm_detail_3 %>% 
   filter(phase_1 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
   summarise(phase_1_start = n(), .groups = 'drop') 
-
-phase_1_complete = trial_firm_detail_3 %>% 
+phase_1_start_eu = trial_firm_detail_3 %>% 
+  filter(region == "EU") %>% 
+  filter(phase_1 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_1_start_eu = n(), .groups = 'drop')
+phase_1_start_us = trial_firm_detail_3 %>% 
+  filter(region == "US") %>% 
+  filter(phase_1 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_1_start_us = n(), .groups = 'drop')
+phase_1_start_others = trial_firm_detail_3 %>% 
+  filter(region == "Others") %>% 
+  filter(phase_1 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_1_start_others = n(), .groups = 'drop')
+phase_1_enddate_comp = trial_firm_detail_3 %>% 
+  filter(status == "completed") %>% 
+  filter(phase_1 == 1) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(phase_1_enddate_comp = n(), .groups = 'drop') 
+phase_1_enddate_term = trial_firm_detail_3 %>% 
+  filter(status == "terminated") %>% 
+  filter(phase_1 == 1) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(phase_1_enddate_term = n(), .groups = 'drop') 
+phase_1_startdate_comp = trial_firm_detail_3 %>% 
   filter(status == "completed") %>% 
   filter(phase_1 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
-  summarise(phase_1_complete = n(), .groups = 'drop') 
-
-phase_1_terminate = trial_firm_detail_3 %>% 
+  summarise(phase_1_startdate_comp = n(), .groups = 'drop') 
+phase_1_startdate_term = trial_firm_detail_3 %>% 
   filter(status == "terminated") %>% 
   filter(phase_1 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
-  summarise(phase_1_terminate = n(), .groups = 'drop') 
+  summarise(phase_1_startdate_term = n(), .groups = 'drop') 
 
 
-# phase 2 start, complete, terminate
+# phase 2 start, start_eu, start_us, start_others, complete, terminate
 phase_2_start = trial_firm_detail_3 %>% 
   filter(phase_2 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
   summarise(phase_2_start = n(), .groups = 'drop') 
-
-phase_2_complete = trial_firm_detail_3 %>% 
+phase_2_start_eu = trial_firm_detail_3 %>% 
+  filter(region == "EU") %>% 
+  filter(phase_2 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_2_start_eu = n(), .groups = 'drop')
+phase_2_start_us = trial_firm_detail_3 %>% 
+  filter(region == "US") %>% 
+  filter(phase_2 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_2_start_us = n(), .groups = 'drop')
+phase_2_start_others = trial_firm_detail_3 %>% 
+  filter(region == "Others") %>% 
+  filter(phase_2 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_2_start_others = n(), .groups = 'drop')
+phase_2_enddate_comp = trial_firm_detail_3 %>% 
+  filter(status == "completed") %>% 
+  filter(phase_2 == 1) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(phase_2_enddate_comp = n(), .groups = 'drop') 
+phase_2_enddate_term = trial_firm_detail_3 %>% 
+  filter(status == "terminated") %>% 
+  filter(phase_2 == 1) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(phase_2_enddate_term = n(), .groups = 'drop') 
+phase_2_startdate_comp = trial_firm_detail_3 %>% 
   filter(status == "completed") %>% 
   filter(phase_2 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
-  summarise(phase_2_complete = n(), .groups = 'drop') 
-
-phase_2_terminate = trial_firm_detail_3 %>% 
+  summarise(phase_2_startdate_comp = n(), .groups = 'drop') 
+phase_2_startdate_term = trial_firm_detail_3 %>% 
   filter(status == "terminated") %>% 
   filter(phase_2 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
-  summarise(phase_2_terminate = n(), .groups = 'drop') 
+  summarise(phase_2_startdate_term = n(), .groups = 'drop') 
 
 
-# phase 3 start, complete, terminate
+# phase 3 start, start_eu, start_us, start_others, complete, terminate
 phase_3_start = trial_firm_detail_3 %>% 
   filter(phase_3 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
   summarise(phase_3_start = n(), .groups = 'drop') 
-
-phase_3_complete = trial_firm_detail_3 %>% 
+phase_3_start_eu = trial_firm_detail_3 %>% 
+  filter(region == "EU") %>% 
+  filter(phase_3 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_3_start_eu = n(), .groups = 'drop')
+phase_3_start_us = trial_firm_detail_3 %>% 
+  filter(region == "US") %>% 
+  filter(phase_3 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_3_start_us = n(), .groups = 'drop')
+phase_3_start_others = trial_firm_detail_3 %>% 
+  filter(region == "Others") %>% 
+  filter(phase_3 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_3_start_others = n(), .groups = 'drop')
+phase_3_enddate_comp = trial_firm_detail_3 %>% 
+  filter(status == "completed") %>% 
+  filter(phase_3 == 1) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(phase_3_enddate_comp = n(), .groups = 'drop') 
+phase_3_enddate_term = trial_firm_detail_3 %>% 
+  filter(status == "terminated") %>% 
+  filter(phase_3 == 1) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(phase_3_enddate_term = n(), .groups = 'drop') 
+phase_3_startdate_comp = trial_firm_detail_3 %>% 
   filter(status == "completed") %>% 
   filter(phase_3 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
-  summarise(phase_3_complete = n(), .groups = 'drop') 
-
-phase_3_terminate = trial_firm_detail_3 %>% 
+  summarise(phase_3_startdate_comp = n(), .groups = 'drop') 
+phase_3_startdate_term = trial_firm_detail_3 %>% 
   filter(status == "terminated") %>% 
   filter(phase_3 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
-  summarise(phase_3_terminate = n(), .groups = 'drop') 
+  summarise(phase_3_startdate_term = n(), .groups = 'drop') 
 
 
-# phase 4 start, complete, terminate
+# phase 4 start, start_eu, start_us, start_others, complete, terminate
 phase_4_start = trial_firm_detail_3 %>% 
   filter(phase_4 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
   summarise(phase_4_start_ = n(), .groups = 'drop') 
-
-phase_4_complete = trial_firm_detail_3 %>% 
+phase_4_start_eu = trial_firm_detail_3 %>% 
+  filter(region == "EU") %>% 
+  filter(phase_4 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_4_start_eu = n(), .groups = 'drop')
+phase_4_start_us = trial_firm_detail_3 %>% 
+  filter(region == "US") %>% 
+  filter(phase_4 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_4_start_us = n(), .groups = 'drop')
+phase_4_start_others = trial_firm_detail_3 %>% 
+  filter(region == "Others") %>% 
+  filter(phase_4 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(phase_4_start_others = n(), .groups = 'drop')
+phase_4_enddate_comp = trial_firm_detail_3 %>% 
+  filter(status == "completed") %>% 
+  filter(phase_4 == 1) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(phase_4_enddate_comp = n(), .groups = 'drop') 
+phase_4_enddate_term = trial_firm_detail_3 %>% 
+  filter(status == "terminated") %>% 
+  filter(phase_4 == 1) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(phase_4_enddate_term = n(), .groups = 'drop') 
+phase_4_startdate_comp = trial_firm_detail_3 %>% 
   filter(status == "completed") %>% 
   filter(phase_4 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
-  summarise(phase_4_complete = n(), .groups = 'drop') 
-
-phase_4_terminate = trial_firm_detail_3 %>% 
+  summarise(phase_4_startdate_comp = n(), .groups = 'drop') 
+phase_4_startdate_term = trial_firm_detail_3 %>% 
   filter(status == "terminated") %>% 
   filter(phase_4 == 1) %>% 
   group_by(sponsor_id, start_year) %>% 
-  summarise(phase_4_terminate = n(), .groups = 'drop') 
+  summarise(phase_4_startdate_term = n(), .groups = 'drop') 
 
 firm_year_dataset_2 = firm_year_dataset_1 %>% 
   left_join(phase_1_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
-  left_join(phase_1_complete, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
-  left_join(phase_1_terminate, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_1_start_eu, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_1_start_us, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_1_start_others, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_1_enddate_comp, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  left_join(phase_1_enddate_term, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  left_join(phase_1_startdate_comp, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_1_startdate_term, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
   left_join(phase_2_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
-  left_join(phase_2_complete, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
-  left_join(phase_2_terminate, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_2_start_eu, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_2_start_us, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_2_start_others, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_2_enddate_comp, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  left_join(phase_2_enddate_term, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  left_join(phase_2_startdate_comp, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_2_startdate_term, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
   left_join(phase_3_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
-  left_join(phase_3_complete, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
-  left_join(phase_3_terminate, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_3_start_eu, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_3_start_us, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_3_start_others, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_3_enddate_comp, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  left_join(phase_3_enddate_term, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  left_join(phase_3_startdate_comp, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_3_startdate_term, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
   left_join(phase_4_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>%
-  left_join(phase_4_complete, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
-  left_join(phase_4_terminate, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_4_start_eu, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_4_start_us, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_4_start_others, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_4_enddate_comp, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  left_join(phase_4_enddate_term, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  left_join(phase_4_startdate_comp, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(phase_4_startdate_term, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
   mutate(across(everything(), ~ replace_na(., 0)))
 
 ```
@@ -1130,7 +1257,14 @@ firm_year_dataset_2 = firm_year_dataset_1 %>%
 # Create the EU exposure variables
 
 any_eu_pre_2016: coded as 1 if a company has at least 1 trial in GDPR affected countries (EU countries) before 2016
-above_median_eu_pre_2016: 
+eu_porp_pre_2016: the proportion of a company's trial that took place in EU before 2018
+above_median_eu_pre_2016: coded as 1 if eu_porp_pre_2016 is above median
+
+any_eu_pre_2018: Same as any_eu_pre_2016 but 2018 instead
+eu_porp_pre_2018: Same as eu_porp_pre_2016 but 2018 instead
+above_median_eu_pre_2018: Same as above_median_eu_pre_2016 but 2018 instead
+
+Also, We want to create the separated counts of all 6 categories for each phases as well, total 6*5=30 new variables
 
 Note: We have missing values for country
 
@@ -1138,34 +1272,169 @@ Note: We have missing values for country
 # Add the column any_eu_pre_2016 and above_median_eu_pre_2016 to firm_year_dataset_2
 eu_countries = c("Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus", "Czech Republic", "Denmark", "Estonia", "Finland", "France", "Germany", "Greece", "Hungary", "Ireland", "Italy", "Latvia", "Lithuania", "Luxembourg", "Malta", "Netherlands", "Poland", "Portugal", "Romania", "Slovakia", "Slovenia", "Spain", "Sweden", "United Kingdom")   # Should we include UK since UK is in EU before 2016
 
+# 2016 cutoff
+# All phases
 eu_expose_pre_2016 = trial_firm_detail_3 %>% 
   filter(start_year < "2016") %>% 
   mutate(any_eu_pre_2016 = ifelse(country %in% eu_countries, 1, 0)) %>% 
   group_by(sponsor_id) %>% 
-  summarise(eu_porp_pre_2016 = mean(any_eu_pre_2016), # calculate proportion of eu trials
-            any_eu_pre_2016 = max(any_eu_pre_2016)) # 1 if any trial is in EU) 
-
-
-eu_prop_median = median(eu_expose_pre_2016$eu_porp_pre_2016) # Calculate the median of EU proportion
-
+  summarise(eu_porp_pre_2016 = round(mean(any_eu_pre_2016), 3), # calculate proportion of eu trials
+            any_eu_pre_2016 = max(any_eu_pre_2016)) # 1 if any trial is in EU
+eu_prop_median_pre_2016 = median(eu_expose_pre_2016$eu_porp_pre_2016) # Calculate the median of EU proportion, 0.864
 eu_expose_pre_2016 = eu_expose_pre_2016 %>% 
-  mutate(above_median_eu_pre_2016 = ifelse(eu_porp_pre_2016>eu_prop_median, 1, 0)) %>% # 1 if EU proportion > median
-  select(-eu_porp_pre_2016)
+  mutate(above_median_eu_pre_2016 = ifelse(eu_porp_pre_2016>eu_prop_median_pre_2016, 1, 0)) # 1 if EU proportion > median
 
+# Phase 1
+eu_expose_pre_2016_p1 = trial_firm_detail_3 %>% 
+  filter(phase_1 == 1) %>% 
+  filter(start_year < "2016") %>% 
+  mutate(any_eu_pre_2016_p1 = ifelse(country %in% eu_countries, 1, 0)) %>% 
+  group_by(sponsor_id) %>% 
+  summarise(eu_porp_pre_2016_p1 = round(mean(any_eu_pre_2016_p1), 3), 
+            any_eu_pre_2016_p1 = max(any_eu_pre_2016_p1)) 
+eu_prop_median_pre_2016_p1 = median(eu_expose_pre_2016_p1$eu_porp_pre_2016_p1) # eu_prop_median_pre_2016_p1 = 0
+eu_expose_pre_2016_p1 = eu_expose_pre_2016_p1 %>% 
+  mutate(above_median_eu_pre_2016_p1 = ifelse(eu_porp_pre_2016_p1>eu_prop_median_pre_2016_p1, 1, 0)) 
+
+# Phase 2
+eu_expose_pre_2016_p2 = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(start_year < "2016") %>% 
+  mutate(any_eu_pre_2016_p2 = ifelse(country %in% eu_countries, 1, 0)) %>% 
+  group_by(sponsor_id) %>% 
+  summarise(eu_porp_pre_2016_p2 = round(mean(any_eu_pre_2016_p2), 3), 
+            any_eu_pre_2016_p2 = max(any_eu_pre_2016_p2)) 
+eu_prop_median_pre_2016_p2 = median(eu_expose_pre_2016_p2$eu_porp_pre_2016_p2) # eu_prop_median_pre_2016_p2 = 0.6
+eu_expose_pre_2016_p2 = eu_expose_pre_2016_p2 %>% 
+  mutate(above_median_eu_pre_2016_p2 = ifelse(eu_porp_pre_2016_p2>eu_prop_median_pre_2016_p2, 1, 0)) 
+
+# Phase 3
+eu_expose_pre_2016_p3 = trial_firm_detail_3 %>% 
+  filter(phase_3 == 1) %>% 
+  filter(start_year < "2016") %>% 
+  mutate(any_eu_pre_2016_p3 = ifelse(country %in% eu_countries, 1, 0)) %>% 
+  group_by(sponsor_id) %>% 
+  summarise(eu_porp_pre_2016_p3 = round(mean(any_eu_pre_2016_p3), 3), 
+            any_eu_pre_2016_p3 = max(any_eu_pre_2016_p3)) 
+eu_prop_median_pre_2016_p3 = median(eu_expose_pre_2016_p3$eu_porp_pre_2016_p3) # eu_prop_median_pre_2016_p3 = 0.936
+eu_expose_pre_2016_p3 = eu_expose_pre_2016_p3 %>% 
+  mutate(above_median_eu_pre_2016_p3 = ifelse(eu_porp_pre_2016_p3>eu_prop_median_pre_2016_p3, 1, 0)) 
+
+# Phase 4
+eu_expose_pre_2016_p4 = trial_firm_detail_3 %>% 
+  filter(phase_4 == 1) %>% 
+  filter(start_year < "2016") %>% 
+  mutate(any_eu_pre_2016_p4 = ifelse(country %in% eu_countries, 1, 0)) %>% 
+  group_by(sponsor_id) %>% 
+  summarise(eu_porp_pre_2016_p4 = round(mean(any_eu_pre_2016_p4), 3), 
+            any_eu_pre_2016_p4 = max(any_eu_pre_2016_p4)) 
+eu_prop_median_pre_2016_p4 = median(eu_expose_pre_2016_p4$eu_porp_pre_2016_p4) # eu_prop_median_pre_2016_p2 = 1
+eu_expose_pre_2016_p4 = eu_expose_pre_2016_p4 %>% 
+  mutate(above_median_eu_pre_2016_p4 = ifelse(eu_porp_pre_2016_p4>eu_prop_median_pre_2016_p4, 1, 0)) 
+
+
+
+
+# 2018 cutoff
+# All phases
+eu_expose_pre_2018 = trial_firm_detail_3 %>% 
+  filter(start_year < "2018") %>% 
+  mutate(any_eu_pre_2018 = ifelse(country %in% eu_countries, 1, 0)) %>% 
+  group_by(sponsor_id) %>% 
+  summarise(eu_porp_pre_2018 = round(mean(any_eu_pre_2018), 3), # calculate proportion of eu trials
+            any_eu_pre_2018 = max(any_eu_pre_2018)) # 1 if any trial is in EU
+eu_prop_median_pre_2018 = median(eu_expose_pre_2018$eu_porp_pre_2018) # Calculate the median of EU proportion, 0.778
+eu_expose_pre_2018 = eu_expose_pre_2018 %>% 
+  mutate(above_median_eu_pre_2018 = ifelse(eu_porp_pre_2018>eu_prop_median_pre_2018, 1, 0)) # 1 if EU proportion > median
+
+# Phase 1
+eu_expose_pre_2018_p1 = trial_firm_detail_3 %>% 
+  filter(phase_1 == 1) %>% 
+  filter(start_year < "2018") %>% 
+  mutate(any_eu_pre_2018_p1 = ifelse(country %in% eu_countries, 1, 0)) %>% 
+  group_by(sponsor_id) %>% 
+  summarise(eu_porp_pre_2018_p1 = round(mean(any_eu_pre_2018_p1), 3), 
+            any_eu_pre_2018_p1 = max(any_eu_pre_2018_p1)) 
+eu_prop_median_pre_2018_p1 = median(eu_expose_pre_2018_p1$eu_porp_pre_2018_p1) # eu_prop_median_pre_2016_p1 = 0
+eu_expose_pre_2018_p1 = eu_expose_pre_2018_p1 %>% 
+  mutate(above_median_eu_pre_2018_p1 = ifelse(eu_porp_pre_2018_p1>eu_prop_median_pre_2018_p1, 1, 0)) 
+
+# Phase 2
+eu_expose_pre_2018_p2 = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(start_year < "2018") %>% 
+  mutate(any_eu_pre_2018_p2 = ifelse(country %in% eu_countries, 1, 0)) %>% 
+  group_by(sponsor_id) %>% 
+  summarise(eu_porp_pre_2018_p2 = round(mean(any_eu_pre_2018_p2), 3), 
+            any_eu_pre_2018_p2 = max(any_eu_pre_2018_p2)) 
+eu_prop_median_pre_2018_p2 = median(eu_expose_pre_2018_p2$eu_porp_pre_2018_p2) # eu_prop_median_pre_2016_p2 = 0.554
+eu_expose_pre_2018_p2 = eu_expose_pre_2018_p2 %>% 
+  mutate(above_median_eu_pre_2018_p2 = ifelse(eu_porp_pre_2018_p2>eu_prop_median_pre_2018_p2, 1, 0)) 
+
+# Phase 3
+eu_expose_pre_2018_p3 = trial_firm_detail_3 %>% 
+  filter(phase_3 == 1) %>% 
+  filter(start_year < "2018") %>% 
+  mutate(any_eu_pre_2018_p3 = ifelse(country %in% eu_countries, 1, 0)) %>% 
+  group_by(sponsor_id) %>% 
+  summarise(eu_porp_pre_2018_p3 = round(mean(any_eu_pre_2018_p3), 3), 
+            any_eu_pre_2018_p3 = max(any_eu_pre_2018_p3)) 
+eu_prop_median_pre_2018_p3 = median(eu_expose_pre_2018_p3$eu_porp_pre_2018_p3) # eu_prop_median_pre_2016_p3 = 0.875
+eu_expose_pre_2018_p3 = eu_expose_pre_2018_p3 %>% 
+  mutate(above_median_eu_pre_2018_p3 = ifelse(eu_porp_pre_2018_p3>eu_prop_median_pre_2018_p3, 1, 0)) 
+
+# Phase 4
+eu_expose_pre_2018_p4 = trial_firm_detail_3 %>% 
+  filter(phase_4 == 1) %>% 
+  filter(start_year < "2018") %>% 
+  mutate(any_eu_pre_2018_p4 = ifelse(country %in% eu_countries, 1, 0)) %>% 
+  group_by(sponsor_id) %>% 
+  summarise(eu_porp_pre_2018_p4 = round(mean(any_eu_pre_2018_p4), 3), 
+            any_eu_pre_2018_p4 = max(any_eu_pre_2018_p4)) 
+eu_prop_median_pre_2018_p4 = median(eu_expose_pre_2018_p4$eu_porp_pre_2018_p4) # eu_prop_median_pre_2016_p2 = 1
+eu_expose_pre_2018_p4 = eu_expose_pre_2018_p4 %>% 
+  mutate(above_median_eu_pre_2018_p4 = ifelse(eu_porp_pre_2018_p4>eu_prop_median_pre_2018_p4, 1, 0)) 
+
+
+
+# Combine all 30 columns
 firm_year_dataset_3 = firm_year_dataset_2 %>% 
   left_join(eu_expose_pre_2016, by = "sponsor_id") %>% 
-  mutate(any_eu_pre_2016 = ifelse(is.na(any_eu_pre_2016), 0, 1)) %>%  # Notice companies founded after 2016 wil have NA values
-  mutate(above_median_eu_pre_2016 = ifelse(is.na(above_median_eu_pre_2016), 0, 1))
-
-
+  left_join(eu_expose_pre_2016_p1, by = "sponsor_id") %>% 
+  left_join(eu_expose_pre_2016_p2, by = "sponsor_id") %>% 
+  left_join(eu_expose_pre_2016_p3, by = "sponsor_id") %>% 
+  left_join(eu_expose_pre_2016_p4, by = "sponsor_id") %>% 
+  left_join(eu_expose_pre_2018, by = "sponsor_id") %>% 
+  left_join(eu_expose_pre_2018_p1, by = "sponsor_id") %>% 
+  left_join(eu_expose_pre_2018_p2, by = "sponsor_id") %>% 
+  left_join(eu_expose_pre_2018_p3, by = "sponsor_id") %>% 
+  left_join(eu_expose_pre_2018_p4, by = "sponsor_id") %>% 
+  mutate(across(everything(), ~ replace_na(., 0))) # Notice companies founded after 2016 will have NA values
 
 
 # Use this code to obtain exposure on company level, independent of time
-firm_year_dataset_3 %>% distinct(sponsor_id, any_eu_pre_2016, above_median_eu_pre_2016, .keep_all = TRUE) %>% 
+firm_year_dataset_3 %>% distinct(sponsor_id, .keep_all = TRUE) %>% 
   select(sponsor_id, sponsor_name, any_eu_pre_2016, above_median_eu_pre_2016)
 
-firm_year_dataset_3 %>% filter(sponsor_id == "21373")
+firm_year_dataset_3
 ```
+
+```{r}
+# Exploratory code
+firm_year_dataset_3 %>% summary()
+
+firm_year_dataset_3 %>% filter(sponsor_id == 90196)
+
+trial_firm_detail_3 %>% filter(sponsor_id == 90196)
+
+trial_firm_detail_3 %>% 
+  filter(phase_3 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  arrange(start_year) %>% 
+  filter(sponsor_id == 90196) %>% 
+  summarise(phase_3_start = n(), .groups = 'drop') 
+```
+
 
 
 ## Export Datasets (Checkpoint)
@@ -1177,8 +1446,8 @@ write.csv(trial_country_dataset, file = "trial_country_dataset.csv")
 write.csv(trial_disease_firm_dataset, file = "trial_disease_firm_dataset.csv")
 
 # Create cvs files with unique company_id and unique country names and id
-write.csv(trial_firm_detail_2, file = "trial_firm_detail_2.csv")
-write.csv(unmatched_companies_with_industry_dummy, file = "unmatched_companies_with_industry_dummy.csv")
+write.csv(trial_firm_detail_3, file = "trial_firm_detail_3.csv")
+write.csv(firm_name_founding_year_id, file = "firm_name_founding_year_id.csv")
 write.csv(firm_year_dataset_3, file = "firm_year_dataset_3.csv")
 
 ```
@@ -1196,11 +1465,9 @@ write.csv(firm_year_dataset_3, file = "firm_year_dataset_3.csv")
 # Task
 
  1. different cut_height for companies start with number and letter
- 2. maybe discard companies with on ly one trial
- 3. fix filtering in trial_firm_detail
- 4. add industry_dummy for firm_year_data, maybe drop academic in the future
- 5. send csv of unmatched_dummy with industry dummy variable, and firm_year_data
- 6. For the firm/year panel, let's also include # of us-based trials and # of EU-based trials (per each phase) per firm/year.  Basically, this will be # of phase I, 2, 3 trials but based on where the country for that trial is (EU or US). If neither US or EU, maybe we can create separate counts too.
+ 2. maybe discard companies with only one trial
+ 3. maybe discard academic sponsor in the future
+ 4. Should we include UK in any_eu_pre_2016 since UK was still in EU then?
  
 
   
