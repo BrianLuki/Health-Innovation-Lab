@@ -17,7 +17,7 @@ library(janitor)
 library(data.table)
 library(ggplot2)
 library(naniar)
-
+library(purrr)
 
 ```
 
@@ -55,11 +55,17 @@ nrow(eu1)
 ```
 
 ```{r}
-#Exploratory code
-eu1 %>% select("trial_therapeutic_area")
+# Create column covid, taking value 1 when the trial is COVID-19 related
+eu1_covid = eu1 %>% 
+  select(eudract_number_with_country, trial_secondary_objectives_of_the_trial, trial_medical_condition_s_being_investigated, full_title_of_the_trial, trial_main_objective_of_the_trial, name_or_abbreviated_title_of_the_trial_where_available, trial_medical_condition_in_easily_understood_language, title_of_the_trial_for_lay_people_in_easily_understood_i_e_non_) %>%
+  filter(if_any(everything(), ~ str_detect(., str_c(c("COVID", "Covid", "covid", "SARS-CoV-2"), collapse = "|")))) %>% 
+  mutate(covid = 1) %>% 
+  select(eudract_number_with_country, covid)
 
-sum(is.na(eu1$"trial_term")&is.na(eu1$"trial_therapeutic_area"))/116815
-colnames(eu1)
+eu1 = eu1 %>% left_join(eu1_covid, by = "eudract_number_with_country")
+
+
+eu6 %>% filter(start_year < 2020) %>% filter(covid == 1)
 ```
 
 Since the datasets consists more than 100 columns, we extract only the column with relevant informations, the mapping to the column name and the information is as follows: 
@@ -91,7 +97,7 @@ Now, we want to construct a dataset with only the mentioned columns
 
 ```{r}
 #Select only the useful columns from the eu1 dataset
-eu2 = eu1 %>% select("eudract_number_with_country", "us_nct_clinicaltrials_gov_registry_number", "sponsors", "trial_term", "trial_therapeutic_area", "date_on_which_this_record_was_first_entered_in_the_eudract_data", "member_state_concerned", "trial_human_pharmacology_phase_i", "trial_therapeutic_exploratory_phase_ii", "trial_therapeutic_confirmatory_phase_iii", "trial_therapeutic_use_phase_iv", "subject_in_the_whole_clinical_trial", "trial_status", "date_of_the_global_end_of_the_trial", "trial_randomised", "trial_parallel_group", "trial_cross_over", "trial_controlled")
+eu2 = eu1 %>% select("eudract_number_with_country", "us_nct_clinicaltrials_gov_registry_number", "sponsors", "trial_term", "trial_therapeutic_area", "date_on_which_this_record_was_first_entered_in_the_eudract_data", "member_state_concerned", "trial_human_pharmacology_phase_i", "trial_therapeutic_exploratory_phase_ii", "trial_therapeutic_confirmatory_phase_iii", "trial_therapeutic_use_phase_iv", "subject_in_the_whole_clinical_trial", "trial_status", "date_of_the_global_end_of_the_trial", "trial_randomised", "trial_parallel_group", "trial_cross_over", "trial_controlled", "covid")
 ```
 
 
@@ -122,13 +128,28 @@ eu3 = left_join(selected_sponsors_df, eu2, by = c("id" = "eudract_number_with_co
 
 eu3 = eu3 %>% select(-"sponsors")
 
-# Also, change the column status_of_the_sponsor into another dummy variable column industry_dummy
+# Change the column status_of_the_sponsor into another dummy variable column industry_dummy
 eu3 = eu3 %>% mutate(industry_dummy = case_when(
   status_of_the_sponsor == "Commercial" ~ 1,
   status_of_the_sponsor == "Non-Commercial" ~ 0,
   )) %>% 
   select(-"status_of_the_sponsor")
 
+# Add column collab_num counting the number of collaborators for each trial
+eu_collab_num_name = eu3 %>% 
+  mutate(industry_collab = ifelse(industry_dummy == 1, name_of_sponsor, NA),
+         non_industry_collab = ifelse(industry_dummy == 0, name_of_sponsor, NA)) %>% 
+  group_by(id) %>% 
+  reframe(collab_num = n()-1, 
+          collaborator = list(unique(name_of_sponsor)),
+          industry_collab = list(unique(industry_collab[!is.na(industry_collab)])),
+          non_industry_collab = list(unique(non_industry_collab[!is.na(non_industry_collab)]))) 
+
+eu3 = eu3 %>% 
+  left_join(eu_collab_num_name, by = "id") %>% 
+  mutate(collaborator = map2(collaborator, name_of_sponsor, ~ .x[.x != .y]),
+         industry_collab = map2(industry_collab, name_of_sponsor, ~ .x[.x != .y]),
+         non_industry_collab = map2(non_industry_collab, name_of_sponsor, ~ .x[.x != .y]))
 ```
 
 Note: 
@@ -202,7 +223,7 @@ eu5 = eu4 %>%
 
 ```
 
-#### randomized,  single_group, and parallel
+#### randomized,  single_group, parallel, and covid
 
   This is related to the design of the trial, randomized takes values of 1 and 0 denoting TRUE and FALSE, single_group takes value of 1 if trial_parallel_group, trial_cross_over, trial_controlled are all FALSE.
   
@@ -213,6 +234,7 @@ eu5 = eu5 %>%
   mutate(randomized = ifelse(trial_randomised == TRUE, 1, 0)) %>% 
   mutate(single_group = ifelse(trial_parallel_group == FALSE & trial_cross_over == FALSE & trial_controlled == FALSE, 1, 0)) %>% 
   mutate(parallel_group = ifelse(trial_parallel_group == TRUE, 1, 0)) %>% 
+  mutate(covid = ifelse(is.na(covid), 0, covid)) %>% 
   select(-c(trial_randomised, trial_parallel_group, trial_cross_over, trial_controlled))
 
 ```
@@ -246,6 +268,7 @@ eu6 = eu5 %>%
     status = trial_status,
     sponsor = name_of_sponsor
   )
+
 ```
 
 
@@ -300,6 +323,12 @@ us_studies_reduced = us_studies %>%
   rename(end_date = completion_date, status = overall_status, patient_num = enrollment) %>% 
   select(nct_id, start_date, end_date, phase, status, patient_num)
 
+# Mark the trials that are COVID-19 related
+us_covid = us_studies %>% 
+  filter(str_detect(official_title, str_c(c("COVID", "Covid", "covid", "SARS-CoV-2"), collapse = "|"))) %>% 
+  mutate(covid = 1) %>% 
+  select(nct_id, covid)
+
 #Collapse the different diseases for the same trial into one observation and select disease from us_conditions
 
 #use us_browse_conditions instead
@@ -317,16 +346,21 @@ us_countries_reduced = us_countries %>%
   rename(country = name) %>% 
   distinct(nct_id, country)
 
-#Separate us_sponsors in to us_collaborator(collaborator) and us_sponsor(lead), and then select collaborator from us_collaborator and sponsors from us_sponsors
+#Separate us_sponsors in to us_collaborator(collaborator) and us_sponsor(lead), and then select and count collaborator from us_collaborator and sponsors from us_sponsors
 us_collaborator = us_sponsors %>% filter(lead_or_collaborator == "collaborator")
 us_sponsor = us_sponsors %>% filter(lead_or_collaborator == "lead")
 
 us_collaborator_reduced = us_collaborator %>% 
-  rename(collaborator = name) %>% 
+  rename(collaborator = name) %>%
+  mutate(industry_collab = ifelse(agency_class == "INDUSTRY", collaborator, NA),
+         non_industry_collab = ifelse(agency_class != "INDUSTRY", collaborator, NA)) %>% 
   group_by(nct_id) %>%
-  summarize(collaborator = paste(unique(collaborator), collapse = ", ")) %>%
+  summarize(collab_num = n(), 
+            collaborator = list(unique(collaborator)),
+            industry_collab = list(unique(industry_collab[!is.na(industry_collab)])),
+            non_industry_collab = list(unique(non_industry_collab[!is.na(non_industry_collab)]))) %>%
   ungroup() %>% 
-  select(nct_id, collaborator)
+  select(nct_id, collab_num, collaborator, industry_collab, non_industry_collab)
 
 us_sponsor_reduced = us_sponsor %>% 
   rename(sponsor = name) %>% 
@@ -339,7 +373,6 @@ us_designs_reduced = us_designs %>%
   mutate(parallel_group = ifelse(intervention_model == "PARALLEL", 1, 0)) %>% 
   select(nct_id, randomized, single_group, parallel_group)
   
-
 ```
 
 
@@ -347,7 +380,7 @@ us_designs_reduced = us_designs %>%
 #Combine the datasets into us1
 
 #Create a list consisting all datasets
-us_datasets = list(us_studies_reduced, us_conditions_reduced, us_countries_reduced, us_sponsor_reduced, us_collaborator_reduced, us_designs_reduced)
+us_datasets = list(us_studies_reduced, us_conditions_reduced, us_countries_reduced, us_sponsor_reduced, us_collaborator_reduced, us_designs_reduced, us_covid)
 
 #Combine US datasets
 us1 = reduce(us_datasets, full_join, by = "nct_id")
@@ -457,15 +490,15 @@ Note that the latest version of EU dataset is eu5, and the latest version of the
 Now, we want to select the columns needed for both datasets and combine them
 
 ```{r}
-#Select the columns needed for both datasets (for now)
+#Select the columns needed for both datasets 
 eu7 = eu6 %>% 
   rename(disease_code_eu = disease_code) %>% 
-  select("nct_id", "eudract_id", "sponsor", "industry_dummy", "country", "disease_code_eu", "start_year", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "end_date", "status", "randomized", "single_group", "parallel_group", "start_date", "end_date")
+  select("nct_id", "eudract_id", "sponsor", "industry_dummy", "country", "disease_code_eu", "start_year", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "end_date", "status", "randomized", "single_group", "parallel_group", "start_date", "end_date", "collab_num", "collaborator", "industry_collab", "non_industry_collab", "covid")
   
 us3 = us2 %>% 
   rename(disease_code_us = disease_code) %>% 
   mutate(patient_num = as.numeric(patient_num)) %>% 
-  select("nct_id", "sponsor", "industry_dummy", "country", "disease_code_us", "start_year", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "end_date", "status", "randomized", "single_group", "parallel_group", "start_date", "end_date")
+  select("nct_id", "sponsor", "industry_dummy", "country", "disease_code_us", "start_year", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "end_date", "status", "randomized", "single_group", "parallel_group", "start_date", "end_date", "collab_num", "collaborator", "industry_collab", "non_industry_collab", "covid")
 
 #For trial in eu6 having nct_id, us the corresponding start_year from us2
 eu7 = eu7 %>%
@@ -512,6 +545,11 @@ disease_code_to_id = clinical_trials_2 %>%
   arrange(disease_code) %>% 
   mutate(disease_id = ifelse(is.na(disease_code), NA, row_number()))
 
+# Create mapping table disease_id_code_term for future use
+disease_id_code_name = disease_code_to_id %>% 
+  left_join(disease_code_to_term, by = c("disease_code" = "mesh_tree")) %>% 
+  select(disease_id, mesh_code = disease_code, disease_name = dscrptr)
+
 #Map each disease_index to each disease_code in clinical_trials_2
 clinical_trials_2 = clinical_trials_2 %>% 
   left_join(disease_code_to_id, by = c("disease_code" = "disease_code"))
@@ -526,16 +564,47 @@ We wish to standardize the companies by changing them all into lowercase and onl
 We will be performing fuzzy match using the stringdist package.
 
 ```{r}
-#Standardize sponsor, and then group and arrange the combined dataset
+#Standardize sponsor, and then group and arrange the combined dataset, also unlist and clean the collaborator columns
 clinical_trials_3 = clinical_trials_2 %>%
   mutate(sponsor = str_to_lower(sponsor)) %>%  # Convert to lowercase
   mutate(sponsor = str_replace_all(sponsor, "[^a-z0-9\\s]", "")) %>%  # Remove non-alphanumeric characters
-  mutate(sponsor = str_trim(sponsor)) %>% 
+  mutate(sponsor = str_trim(sponsor)) %>%   
+  mutate(collaborator = as.character(map(collaborator, ~ .x %>%                  # Clean collaborator names
+                         str_to_lower() %>%                         # Convert to lowercase
+                         str_replace_all("[^a-z0-9\\s]", "") %>%    # Remove non-alphanumeric characters
+                         str_trim() %>%                             # Trim whitespace
+                         str_c(collapse = ", ")))) %>%                # collapse the list of collaborator names
+  mutate(industry_collab = as.character(map(industry_collab, ~ .x %>%                  # Clean collaborator names
+                         str_to_lower() %>%                         # Convert to lowercase
+                         str_replace_all("[^a-z0-9\\s]", "") %>%    # Remove non-alphanumeric characters
+                         str_trim() %>%                             # Trim whitespace
+                         str_c(collapse = ", ")))) %>% 
+  mutate(non_industry_collab = as.character(map(non_industry_collab, ~ .x %>%                  # Clean collaborator names
+                         str_to_lower() %>%                         # Convert to lowercase
+                         str_replace_all("[^a-z0-9\\s]", "") %>%    # Remove non-alphanumeric characters
+                         str_trim() %>%                             # Trim whitespace
+                         str_c(collapse = ", ")))) %>% 
   group_by(sponsor, disease_code, start_year, country) %>%
   arrange(sponsor, disease_code, start_year) %>% 
   ungroup() %>% 
   rename(sponsor_name = sponsor)
 ```
+
+```{r}
+# Clean company and sponsor suffixes
+suffixes = c("llc", "inc", "corp", "corporation", "limited", "co", "company", "ltd", "nasdaq\\w*")
+
+clinical_trials_4 = clinical_trials_3 %>%
+  mutate(sponsor_name = str_remove_all(sponsor_name, paste0("\\b(", paste(suffixes, collapse = "|"), ")\\b"))) %>%
+  mutate(sponsor_name = str_trim(sponsor_name)) %>% 
+  mutate(collaborator = str_remove_all(collaborator, paste0("\\b(", paste(suffixes, collapse = "|"), ")\\b"))) %>%
+  mutate(collaborator = str_trim(collaborator)) %>% 
+  mutate(industry_collab = str_remove_all(industry_collab, paste0("\\b(", paste(suffixes, collapse = "|"), ")\\b"))) %>%
+  mutate(industry_collab = str_trim(industry_collab)) %>% 
+  mutate(non_industry_collab = str_remove_all(non_industry_collab, paste0("\\b(", paste(suffixes, collapse = "|"), ")\\b"))) %>%
+  mutate(non_industry_collab = str_trim(non_industry_collab))
+```
+
 
 **This following section is the original method to create sponsor name matching. The matching dataset is then being refined and we will updated the false negatives from the matched dataset**
 
@@ -543,13 +612,6 @@ clinical_trials_3 = clinical_trials_2 %>%
 # Assign index to each unique sponsors, use Jaro-Winkler distance to determine if different sponsor names are the same organization
 
 # Following code from ChatGPT
-# Clean company suffixes
-suffixes = c("llc", "inc", "corp", "corporation", "limited", "co", "company", "ltd", "nasdaq\\w*")
-
-clinical_trials_4 = clinical_trials_3 %>%
-  mutate(sponsor_name = str_remove_all(sponsor_name, paste0("\\b(", paste(suffixes, collapse = "|"), ")\\b"))) %>%
-  mutate(sponsor_name = str_trim(sponsor_name))
-
 # Function to calculate Jaro-Winkler distance in batches
 distance_matrix = function(company_names, batch_size = 1000, method = "jw") {
   n = length(company_names)  # Get the total number of company names
@@ -710,7 +772,7 @@ sponsor_name_id = firm_name_founding_year_id_new %>% select(sponsor_name, sponso
 
 clinical_trials_5 = clinical_trials_4 %>% 
   left_join(sponsor_name_id, by = c("sponsor_name" = "sponsor_name")) %>% 
-  select("nct_id", "eudract_id", "sponsor_name", "industry_dummy", "sponsor_id", "disease_code", "disease_code_eu", "disease_code_us", "disease_term", "disease_id", "start_year",  "country", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "end_date", "status", "randomized", "single_group", "parallel_group", "start_date", "end_date")
+  select("nct_id", "eudract_id", "sponsor_name", "industry_dummy", "sponsor_id", "disease_code", "disease_code_eu", "disease_code_us", "disease_term", "disease_id", "start_year",  "country", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "end_date", "status", "randomized", "single_group", "parallel_group", "start_date", "end_date", "collab_num", "collaborator", "industry_collab", "non_industry_collab", "covid")
 
 # 865051 observations
 ```
@@ -812,7 +874,7 @@ country_name_to_id = clinical_trials_5 %>%
 #Map each disease_index to each disease_code in clinical_trials_2
 clinical_trials_6 = clinical_trials_5 %>% 
   left_join(country_name_to_id, by = "country") %>% 
-  select("nct_id", "eudract_id", "sponsor_name", "industry_dummy", "sponsor_id", "disease_code", "disease_code_eu", "disease_code_us", "disease_term", "disease_id", "start_year",  "country", "country_id", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "status", "randomized", "single_group", "parallel_group", "start_date", "end_date")
+  select("nct_id", "eudract_id", "sponsor_name", "industry_dummy", "sponsor_id", "disease_code", "disease_code_eu", "disease_code_us", "disease_term", "disease_id", "start_year",  "country", "country_id", "phase_1", "phase_2", "phase_3", "phase_4", "patient_num", "status", "randomized", "single_group", "parallel_group", "start_date", "end_date", "collab_num", "collaborator", "industry_collab", "non_industry_collab", "covid")
 
 # 865051
 ```
@@ -861,6 +923,11 @@ clinical_trials_7 = clinical_trials_6 %>%
   mutate(single_group = ifelse(is.na(single_group), "", single_group)) %>%
   mutate(parallel_group = ifelse(is.na(parallel_group), "", parallel_group)) %>%
   mutate(end_year = ifelse(is.na(end_date), "", year(end_date))) %>% 
+  mutate(collab_num = ifelse(is.na(collab_num), 0, collab_num)) %>% 
+  mutate(collaborator = ifelse(is.na(collaborator), "", collaborator)) %>% 
+  mutate(industry_collab = ifelse(is.na(industry_collab), "", industry_collab)) %>% 
+  mutate(non_industry_collab = ifelse(is.na(non_industry_collab), "", non_industry_collab)) %>% 
+  mutate(covid = ifelse(is.na(covid), 0, covid)) %>% 
   mutate(phase_1 = ifelse(phase_1 == TRUE, 1, 0)) %>% 
   mutate(phase_2 = ifelse(phase_2 == TRUE, 1, 0)) %>% 
   mutate(phase_3 = ifelse(phase_3 == TRUE, 1, 0)) %>% 
@@ -882,11 +949,11 @@ clinical_trials_7 %>%
 ```
 
 ```{r}
-# Notice that there are 864859 unique trials where there are 865051 rows, we remove these obvious duplicates first
+# Notice that there are 862993 unique trials where there are 865051 rows, we remove these obvious duplicates first
 clinical_trials_8 = clinical_trials_7 %>% 
   distinct(sponsor_id, country_id, nct_id, eudract_id, .keep_all=TRUE)
 
-# From 865051 to 864859 observations
+# From 865051 to 862993 observations
 ```
 
 Moving on, we want to make sure there's no overlap in EU data and the US data, on the sponsor-disease-start_year-country level.
@@ -913,7 +980,7 @@ clinical_trials_9 = clinical_trials_9 %>%
   bind_rows(eu_with_nct_id) %>% 
   distinct(nct_id, eudract_id, sponsor_id, disease_id, start_year, country_id, .keep_all=TRUE)
 
-# From 864859 to 858602
+# From 862993 to 855991
 ```
 
 ## Construct datasets for easier use
@@ -962,7 +1029,7 @@ trial_firm_detail_1 = main_raw_dataset %>%
               mutate(sponsor_found_year = ifelse(is.na(year_founded), "", year_founded)) %>% 
               mutate(sponsor_id = as.character(sponsor_id)) %>% 
               select(sponsor_name, sponsor_id, sponsor_found_year), by = c("sponsor_name" = "sponsor_name", "sponsor_id" = "sponsor_id")) %>% 
-  select(trial_id, sponsor_name, sponsor_id, sponsor_found_year, start_year, country, phase_1, phase_2, phase_3, phase_4, patient_num, status, end_year, industry_dummy, source, disease_id, nct_id, eudract_id, randomized, single_group, parallel_group, start_date, end_date) %>% 
+  select(trial_id, sponsor_name, sponsor_id, sponsor_found_year, start_year, country, phase_1, phase_2, phase_3, phase_4, patient_num, status, end_year, industry_dummy, source, disease_id, nct_id, eudract_id, randomized, single_group, parallel_group, start_date, end_date, collab_num, collaborator, industry_collab, non_industry_collab, covid) %>% 
   mutate(sponsor_found_year = ifelse(is.na(sponsor_found_year), "", sponsor_found_year))
 
 
@@ -971,8 +1038,7 @@ trial_firm_detail_1 = trial_firm_detail_1 %>%
   mutate(matched_capiq = ifelse(sponsor_found_year == "", 0, 1))
 
 
-# 858602
-
+# 855991
 ```
 
 #### Define valid trials
@@ -1029,7 +1095,7 @@ trial_firm_detail_2 = trial_firm_detail_2 %>%
 # exploratory code
 unmatched_companies_with_industry_dummy = trial_firm_detail_2 %>% distinct(sponsor_id, .keep_all = TRUE) %>% select(sponsor_name, sponsor_id, matched_capiq, industry_dummy) %>% filter(matched_capiq == 0)
 
-# 445663
+# 443403
 ```
 
 ```{r}
@@ -1042,7 +1108,7 @@ trial_firm_detail_3 = trial_firm_detail_2 %>% mutate(region = case_when(
   TRUE ~ "Others"
 ))
 
-# 445663
+# 443403
 ```
 
 #### Zombie trials
@@ -1095,7 +1161,7 @@ trial_firm_detail_3 = trial_firm_detail_3 %>%
   mutate(sponsor_id = ifelse(is.na(sponsor_id), "", sponsor_id)) %>% 
   mutate(across(everything(), ~ replace_na(., 0)))
 
-# 445663
+# 443403
 ```
 
    
@@ -1117,7 +1183,7 @@ firm_year_dataset_1 = trial_firm_detail_3 %>%
 # Note that some companies share different names but have the same sponsor_id, we want to make sure all sponsor_id year combination is unique
 firm_year_dataset_1 = firm_year_dataset_1 %>% distinct(sponsor_id, year, .keep_all = TRUE) %>% arrange(sponsor_id, year)
 
-# 319750
+# 319741
 ```
 
 ##### Add trial counts for each start/end year and phase
@@ -1329,7 +1395,7 @@ firm_year_dataset_2 = firm_year_dataset_1 %>%
   left_join(phase_4_startdate_term, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
   mutate(across(everything(), ~ replace_na(., 0)))
 
-# 319750
+# 319741
 ```
 
 
@@ -1434,7 +1500,7 @@ eu_expose_pre_2018_p1 = trial_firm_detail_3 %>%
   group_by(sponsor_id) %>% 
   summarise(eu_porp_pre_2018_p1 = round(mean(any_eu_pre_2018_p1), 3), 
             any_eu_pre_2018_p1 = max(any_eu_pre_2018_p1)) 
-eu_prop_median_pre_2018_p1 = median(eu_expose_pre_2018_p1$eu_porp_pre_2018_p1) # eu_prop_median_pre_2016_p1 = 0
+eu_prop_median_pre_2018_p1 = median(eu_expose_pre_2018_p1$eu_porp_pre_2018_p1) # eu_prop_median_pre_2018_p1 = 0
 eu_expose_pre_2018_p1 = eu_expose_pre_2018_p1 %>% 
   mutate(above_median_eu_pre_2018_p1 = ifelse(eu_porp_pre_2018_p1>eu_prop_median_pre_2018_p1, 1, 0)) 
 
@@ -1446,7 +1512,7 @@ eu_expose_pre_2018_p2 = trial_firm_detail_3 %>%
   group_by(sponsor_id) %>% 
   summarise(eu_porp_pre_2018_p2 = round(mean(any_eu_pre_2018_p2), 3), 
             any_eu_pre_2018_p2 = max(any_eu_pre_2018_p2)) 
-eu_prop_median_pre_2018_p2 = median(eu_expose_pre_2018_p2$eu_porp_pre_2018_p2) # eu_prop_median_pre_2016_p2 = 0.554
+eu_prop_median_pre_2018_p2 = median(eu_expose_pre_2018_p2$eu_porp_pre_2018_p2) # eu_prop_median_pre_2018_p2 = 0.4
 eu_expose_pre_2018_p2 = eu_expose_pre_2018_p2 %>% 
   mutate(above_median_eu_pre_2018_p2 = ifelse(eu_porp_pre_2018_p2>eu_prop_median_pre_2018_p2, 1, 0)) 
 
@@ -1458,7 +1524,7 @@ eu_expose_pre_2018_p3 = trial_firm_detail_3 %>%
   group_by(sponsor_id) %>% 
   summarise(eu_porp_pre_2018_p3 = round(mean(any_eu_pre_2018_p3), 3), 
             any_eu_pre_2018_p3 = max(any_eu_pre_2018_p3)) 
-eu_prop_median_pre_2018_p3 = median(eu_expose_pre_2018_p3$eu_porp_pre_2018_p3) # eu_prop_median_pre_2016_p3 = 0.875
+eu_prop_median_pre_2018_p3 = median(eu_expose_pre_2018_p3$eu_porp_pre_2018_p3) # eu_prop_median_pre_2018_p3 = 0.875
 eu_expose_pre_2018_p3 = eu_expose_pre_2018_p3 %>% 
   mutate(above_median_eu_pre_2018_p3 = ifelse(eu_porp_pre_2018_p3>eu_prop_median_pre_2018_p3, 1, 0)) 
 
@@ -1470,7 +1536,7 @@ eu_expose_pre_2018_p4 = trial_firm_detail_3 %>%
   group_by(sponsor_id) %>% 
   summarise(eu_porp_pre_2018_p4 = round(mean(any_eu_pre_2018_p4), 3), 
             any_eu_pre_2018_p4 = max(any_eu_pre_2018_p4)) 
-eu_prop_median_pre_2018_p4 = median(eu_expose_pre_2018_p4$eu_porp_pre_2018_p4) # eu_prop_median_pre_2016_p2 = 1
+eu_prop_median_pre_2018_p4 = median(eu_expose_pre_2018_p4$eu_porp_pre_2018_p4) # eu_prop_median_pre_2018_p2 = 1
 eu_expose_pre_2018_p4 = eu_expose_pre_2018_p4 %>% 
   mutate(above_median_eu_pre_2018_p4 = ifelse(eu_porp_pre_2018_p4>eu_prop_median_pre_2018_p4, 1, 0)) 
 
@@ -1490,7 +1556,7 @@ firm_year_dataset_3 = firm_year_dataset_2 %>%
   left_join(eu_expose_pre_2018_p4, by = "sponsor_id") %>% 
   mutate(across(everything(), ~ replace_na(., 0))) # Notice companies founded after 2016 will have NA values
 
-# 319750
+# 319741
 
 # Use this code to obtain exposure on company level, independent of time
 firm_year_dataset_3 %>% distinct(sponsor_id, .keep_all = TRUE) %>% 
@@ -1757,7 +1823,7 @@ firm_year_dataset_4 = firm_year_dataset_3 %>%
   left_join(patient_mean_ending_us.eu.others_phase4, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
   mutate(across(everything(), ~ replace_na(., 0)))
 
-# 319750
+# 319741
 firm_year_dataset_4 %>% select(sponsor_name, sponsor_id, year, phase_2_start) %>% arrange(desc(phase_2_start))
 ```
 
@@ -1823,7 +1889,7 @@ firm_year_dataset_5 = firm_year_dataset_4 %>%
   left_join(phase_2_start_zombie_outliar, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
   mutate(across(everything(), ~ replace_na(., 0)))
 
-# 319750
+# 319741
 ```
 
 ##### Add type 2 for phase_2_startdate_comp, phase_2_enddate_comp, phase_2_startdate_term, phase_2_enddate_term
@@ -1892,7 +1958,7 @@ firm_year_dataset_6 = firm_year_dataset_5 %>%
   mutate(across(everything(), ~ replace_na(., 0))) %>% 
   mutate(phase_2_enddate_term_type2ex = phase_2_enddate_term - phase_2_enddate_term_type2)
 
-# 319750
+# 319741
 ```
 
 ##### Add variable phase_2_active, phase_2_active_zombie_75percent, phase_2_active_zombie_outliar, phase_2_comp_rate and phase_2_term_rate 
@@ -1926,7 +1992,7 @@ firm_year_dataset_7 = firm_year_dataset_6 %>%
   left_join(phase_2_active_zombie_comp_term_rate, by = c("sponsor_id", "year")) %>% 
   mutate(across(everything(), ~ replace_na(., 0)))
 
-# 319750
+# 319741
 ```
 
 ##### Add phase_2_startdate_trans_rate and phase_2_enddate_trans_rate
@@ -1978,7 +2044,7 @@ firm_year_dataset_8 = firm_year_dataset_7 %>%
   mutate(phase_2_enddate_trans_rate = phase_2_enddate_trans/(phase_2_enddate_comp + phase_2_enddate_term)) %>% 
   mutate(across(everything(), ~ replace_na(., 0)))
 
-# 319750
+# 319741
 ```
 
 ##### Add random/single_group/parallel_group summaries
@@ -2053,19 +2119,771 @@ firm_year_dataset_9 = firm_year_dataset_8 %>%
   left_join(enddate_p2_random_nonrandom_single_parallel_group, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
   mutate(across(everything(), ~ replace_na(., 0))) 
 
-# 319750
+# 319741
 ```
+  
+  
+##### Add collaborator summaries
+
+  Here we want to keep track of the numbers of collaborators in many ways:
+
+  (all phase/p2) * (total/unique) * (active/new/old) * collaborator 
+  p2_trial_with_collab
+  
+  With total of 13 new columns
+
+```{r}
+# Define the preserve_setdiff function to use later on
+preserve_setdiff <- function(a, b) {
+  for (item in b) {
+    match_index <- match(item, a)  # Find the first occurrence of the item in `a`
+    if (!is.na(match_index)) {
+      a <- a[-match_index]        # Remove that occurrence from `a`
+    }
+  }
+  return(a)
+}
+
+
+# Create variables all_phase*total/unique*ongoing/new/old
+allphase_total_start_collab = trial_firm_detail_3 %>% 
+  select(sponsor_id, start_year, collab_num, collaborator) %>% 
+  filter(collab_num > 0) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarize(allphase_total_new_collab = sum(collab_num), allphase_total_new_collab_name = str_c(collaborator, collapse = ", "))
+
+allphase_total_end_collab = trial_firm_detail_3 %>% 
+  select(sponsor_id, end_year, collab_num, collaborator) %>% 
+  filter(collab_num > 0) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarize(allphase_total_end_collab = sum(collab_num), allphase_total_end_collab_name = str_c(collaborator, collapse = ", "))
+
+allphase_collab = firm_year_dataset_9 %>% 
+  left_join(allphase_total_end_collab, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  left_join(allphase_total_start_collab, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  select(sponsor_id, year, allphase_total_new_collab, allphase_total_new_collab_name, allphase_total_end_collab, allphase_total_end_collab_name) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(allphase_total_new_collab = ifelse(is.na(allphase_total_new_collab), 0, allphase_total_new_collab)) %>% 
+  mutate(allphase_total_end_collab = ifelse(is.na(allphase_total_end_collab), 0, allphase_total_end_collab)) %>% 
+  mutate(allphase_total_new_collab_name = ifelse(is.na(allphase_total_new_collab_name), "", allphase_total_new_collab_name)) %>%
+  mutate(allphase_total_end_collab_name = ifelse(is.na(allphase_total_end_collab_name), "", allphase_total_end_collab_name)) %>%
+  mutate(
+    cum_allphase_total_new_collab = cumsum(allphase_total_new_collab),
+    cum_allphase_total_new_collab_name = accumulate(
+      allphase_total_new_collab_name, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")),
+    cum_allphase_total_end_collab = lag(cumsum(allphase_total_end_collab), default = 0),
+    cum_allphase_total_end_collab_name = lag(accumulate(
+      allphase_total_end_collab_name, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")), default = "")) %>% 
+  rowwise() %>% 
+  mutate(
+    allphase_total_active_collab = cum_allphase_total_new_collab - cum_allphase_total_end_collab,
+    allphase_active_collab_name = preserve_setdiff(str_split(cum_allphase_total_new_collab_name, ", ")[[1]], 
+                                                    str_split(cum_allphase_total_end_collab_name, ", ")[[1]]) %>% 
+      paste(collapse = ", "),
+    allphase_unique_active_collab_name = allphase_active_collab_name %>% 
+      str_split(",\\s*") %>% unlist() %>% unique() %>% paste(collapse = ", ") ,
+    allphase_unique_active_collab = allphase_unique_active_collab_name %>% str_split(",\\s*") %>% map_int(~ length(unique(.x))),
+    allphase_unique_active_collab = ifelse(allphase_unique_active_collab_name == "", 0, allphase_unique_active_collab)
+    ) %>% 
+  ungroup() %>% 
+  mutate(
+    # Convert active and new collaborators into lists (ignoring empty strings)
+    active_unique_collab_list = str_split(allphase_unique_active_collab_name, ",\\s*"),
+    new_collab_list = str_split(allphase_total_new_collab_name, ",\\s*"),
+    # Compare current new collaborators with previous year's active collaborators
+    allphase_unique_new_collab = map2_dbl(
+      new_collab_list, 
+      lag(active_unique_collab_list, default = list(character(0))), 
+      ~ length(setdiff(.x[.x != ""], .y[.y != ""])) # Remove empty strings and calculate unique collaborators
+    ),
+    allphase_total_old_collab = allphase_total_active_collab - allphase_total_new_collab,
+    allphase_unique_old_collab = allphase_unique_active_collab - allphase_unique_new_collab,
+  ) %>% 
+  ungroup() %>% 
+  select(sponsor_id, year, allphase_total_active_collab, allphase_total_new_collab, allphase_total_old_collab, allphase_unique_active_collab, allphase_unique_new_collab, allphase_unique_old_collab)
+
+  
+
+# Create variables p2*total/unique*ongoing/new/old*collab
+p2_total_start_collab = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  select(sponsor_id, start_year, collab_num, collaborator) %>% 
+  filter(collab_num > 0) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarize(p2_total_new_collab = sum(collab_num), p2_total_new_collab_name = str_c(collaborator, collapse = ", "))
+
+p2_total_end_collab = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  select(sponsor_id, end_year, collab_num, collaborator) %>% 
+  filter(collab_num > 0) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarize(p2_total_end_collab = sum(collab_num), p2_total_end_collab_name = str_c(collaborator, collapse = ", "))
+
+p2_collab = firm_year_dataset_9 %>% 
+  left_join(p2_total_start_collab, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_total_end_collab, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  select(sponsor_id, year, p2_total_new_collab, p2_total_new_collab_name, p2_total_end_collab, p2_total_end_collab_name) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(p2_total_new_collab = ifelse(is.na(p2_total_new_collab), 0, p2_total_new_collab)) %>% 
+  mutate(p2_total_end_collab = ifelse(is.na(p2_total_end_collab), 0, p2_total_end_collab)) %>% 
+  mutate(p2_total_new_collab_name = ifelse(is.na(p2_total_new_collab_name), "", p2_total_new_collab_name)) %>%
+  mutate(p2_total_end_collab_name = ifelse(is.na(p2_total_end_collab_name), "", p2_total_end_collab_name)) %>%
+  mutate(
+    cum_p2_total_new_collab = cumsum(p2_total_new_collab),
+    cum_p2_total_new_collab_name = accumulate(
+      p2_total_new_collab_name, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")),
+    cum_p2_total_end_collab = lag(cumsum(p2_total_end_collab), default = 0),
+    cum_p2_total_end_collab_name = lag(accumulate(
+      p2_total_end_collab_name, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")), default = "")) %>% 
+  rowwise() %>% 
+  mutate(
+    p2_total_active_collab = cum_p2_total_new_collab - cum_p2_total_end_collab,
+    p2_unique_active_collab_name = preserve_setdiff(str_split(cum_p2_total_new_collab_name, ", ")[[1]], 
+                                                    str_split(cum_p2_total_end_collab_name, ", ")[[1]]) %>% 
+      paste(collapse = ", "),
+    p2_unique_active_collab = p2_unique_active_collab_name %>% str_split(", ") %>% map_int(~ length(unique(.x))),
+    p2_unique_active_collab = ifelse(p2_unique_active_collab_name == "", 0, p2_unique_active_collab)
+    ) %>% 
+  ungroup() %>% 
+  mutate(
+    # Convert active and new collaborators into lists (ignoring empty strings)
+    active_unique_collab_list = str_split(p2_unique_active_collab_name, ",\\s*"),
+    new_unique_collab_list = str_split(p2_total_new_collab_name, ",\\s*"),
+    # Compare current new collaborators with previous year's active collaborators
+    p2_unique_new_collab = map2_dbl(
+      new_unique_collab_list, 
+      lag(active_unique_collab_list, default = list(character(0))), 
+      ~ length(setdiff(.x[.x != ""], .y[.y != ""])) # Remove empty strings and calculate unique collaborators
+    ),
+    p2_total_old_collab = p2_total_active_collab - p2_total_new_collab,
+    p2_unique_old_collab = p2_unique_active_collab - p2_unique_new_collab,
+  ) %>% 
+  ungroup() %>% 
+  select(sponsor_id, year, p2_total_active_collab, p2_total_new_collab, p2_total_old_collab, p2_unique_active_collab, p2_unique_new_collab, p2_unique_old_collab)
+
+
+
+# Create variables p2*total/unique*ongoing/new/old*industry_collab
+p2_total_start_industry_collab = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(industry_collab != "") %>% 
+  select(sponsor_id, start_year, industry_collab) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarize(p2_total_new_industry_collab_name = str_c(industry_collab, collapse = ", "))
+
+p2_total_end_industry_collab = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(industry_collab != "") %>% 
+  select(sponsor_id, end_year, industry_collab) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarize(p2_total_end_industry_collab_name = str_c(industry_collab, collapse = ", "))
+
+p2_industry_collab = firm_year_dataset_9 %>% 
+  left_join(p2_total_start_industry_collab, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_total_end_industry_collab, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  select(sponsor_id, year, p2_total_new_industry_collab_name, p2_total_end_industry_collab_name) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(p2_total_new_industry_collab_name = ifelse(is.na(p2_total_new_industry_collab_name), "", p2_total_new_industry_collab_name)) %>%
+  mutate(p2_total_end_industry_collab_name = ifelse(is.na(p2_total_end_industry_collab_name), "", p2_total_end_industry_collab_name)) %>%
+  mutate(p2_total_new_industry_collab = p2_total_new_industry_collab_name %>% str_split(", ") %>% map_int(~ length(.x)),
+         p2_total_new_industry_collab = ifelse(p2_total_new_industry_collab_name == "", 0, p2_total_new_industry_collab)) %>% 
+  mutate(
+    cum_p2_total_new_industry_collab_name = accumulate(
+      p2_total_new_industry_collab_name, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")),
+    cum_p2_total_end_industry_collab_name = lag(accumulate(
+      p2_total_end_industry_collab_name, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")), default = "")) %>% 
+  rowwise() %>% 
+  mutate(
+    p2_active_industry_collab_name = preserve_setdiff(str_split(cum_p2_total_new_industry_collab_name, ", ")[[1]], 
+                                                    str_split(cum_p2_total_end_industry_collab_name, ", ")[[1]]) %>% 
+      paste(collapse = ", "),
+    p2_active_industry_collab = p2_active_industry_collab_name %>% str_split(", ") %>% map_int(~ length(.x)),
+    p2_active_industry_collab = ifelse(p2_active_industry_collab_name == "", 0, p2_active_industry_collab),
+    p2_unique_active_industry_collab = p2_active_industry_collab_name %>% str_split(", ") %>% map_int(~ length(unique(.x))),
+    p2_unique_active_industry_collab = ifelse(p2_active_industry_collab_name == "", 0, p2_unique_active_industry_collab)
+    ) %>% 
+  ungroup() %>% 
+  mutate(
+    # Convert active and new collaborators into lists (ignoring empty strings)
+    active_industry_collab_list = str_split(p2_active_industry_collab_name, ",\\s*"),
+    new_unique_industry_collab_list = str_split(p2_total_new_industry_collab_name, ",\\s*"),
+    # Compare current new collaborators with previous year's active collaborators
+    p2_unique_new_industry_collab = map2_dbl(
+      new_unique_industry_collab_list, 
+      lag(active_industry_collab_list, default = list(character(0))), 
+      ~ length(unique(setdiff(.x[.x != ""], .y[.y != ""]))) # Remove empty strings and calculate unique collaborators
+    ),
+    p2_total_old_industry_collab = p2_active_industry_collab - p2_total_new_industry_collab,
+    p2_unique_old_industry_collab = p2_unique_active_industry_collab - p2_unique_new_industry_collab,
+  ) %>% 
+  ungroup() %>% 
+  select(sponsor_id, year, p2_total_active_industry_collab = p2_active_industry_collab, p2_total_new_industry_collab, p2_total_old_industry_collab, p2_unique_active_industry_collab, p2_unique_new_industry_collab, p2_unique_old_industry_collab)
+  
+  
+  
+# Create variables p2*total/unique*ongoing/new/old*non_industry_collab
+p2_total_start_non_industry_collab = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(non_industry_collab != "") %>% 
+  select(sponsor_id, start_year, non_industry_collab) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarize(p2_total_new_non_industry_collab_name = str_c(non_industry_collab, collapse = ", "))
+
+p2_total_end_non_industry_collab = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(non_industry_collab != "") %>% 
+  select(sponsor_id, end_year, non_industry_collab) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarize(p2_total_end_non_industry_collab_name = str_c(non_industry_collab, collapse = ", "))
+
+p2_non_industry_collab = firm_year_dataset_9 %>% 
+  left_join(p2_total_start_non_industry_collab, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_total_end_non_industry_collab, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  select(sponsor_id, year, p2_total_new_non_industry_collab_name, p2_total_end_non_industry_collab_name) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(p2_total_new_non_industry_collab_name = ifelse(is.na(p2_total_new_non_industry_collab_name), "", p2_total_new_non_industry_collab_name)) %>%
+  mutate(p2_total_end_non_industry_collab_name = ifelse(is.na(p2_total_end_non_industry_collab_name), "", p2_total_end_non_industry_collab_name)) %>%
+  mutate(p2_total_new_non_industry_collab = p2_total_new_non_industry_collab_name %>% str_split(", ") %>% map_int(~ length(.x)),
+         p2_total_new_non_industry_collab = ifelse(p2_total_new_non_industry_collab_name == "", 0, p2_total_new_non_industry_collab)) %>% 
+  mutate(
+    cum_p2_total_new_non_industry_collab_name = accumulate(
+      p2_total_new_non_industry_collab_name, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")),
+    cum_p2_total_end_non_industry_collab_name = lag(accumulate(
+      p2_total_end_non_industry_collab_name, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")), default = "")) %>% 
+  rowwise() %>% 
+  mutate(
+    p2_active_non_industry_collab_name = preserve_setdiff(str_split(cum_p2_total_new_non_industry_collab_name, ", ")[[1]], 
+                                                    str_split(cum_p2_total_end_non_industry_collab_name, ", ")[[1]]) %>% 
+      paste(collapse = ", "),
+    p2_active_non_industry_collab = p2_active_non_industry_collab_name %>% str_split(", ") %>% map_int(~ length(.x)),
+    p2_active_non_industry_collab = ifelse(p2_active_non_industry_collab_name == "", 0, p2_active_non_industry_collab),
+    p2_unique_active_non_industry_collab = p2_active_non_industry_collab_name %>% str_split(", ") %>% map_int(~ length(unique(.x))),
+    p2_unique_active_non_industry_collab = ifelse(p2_active_non_industry_collab_name == "", 0, p2_unique_active_non_industry_collab)
+    ) %>% 
+  ungroup() %>% 
+  mutate(
+    # Convert active and new collaborators into lists (ignoring empty strings)
+    active_non_industry_collab_list = str_split(p2_active_non_industry_collab_name, ",\\s*"),
+    new_unique_non_industry_collab_list = str_split(p2_total_new_non_industry_collab_name, ",\\s*"),
+    # Compare current new collaborators with previous year's active collaborators
+    p2_unique_new_non_industry_collab = map2_dbl(
+      new_unique_non_industry_collab_list, 
+      lag(active_non_industry_collab_list, default = list(character(0))), 
+      ~ length(setdiff(.x[.x != ""], .y[.y != ""])) # Remove empty strings and calculate unique collaborators
+    ),
+    p2_total_old_non_industry_collab = p2_active_non_industry_collab - p2_total_new_non_industry_collab,
+    p2_unique_old_non_industry_collab = p2_unique_active_non_industry_collab - p2_unique_new_non_industry_collab,
+  ) %>% 
+  ungroup() %>% 
+  select(sponsor_id, year, p2_total_active_non_industry_collab = p2_active_non_industry_collab, p2_total_new_non_industry_collab, p2_total_old_non_industry_collab, p2_unique_active_non_industry_collab, p2_unique_new_non_industry_collab, p2_unique_old_non_industry_collab)
+
+
+
+# Create variable p2_trial_with_collab
+p2_with_collab_start = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  mutate(collab_dummy = ifelse(collab_num == 0, 0, 1)) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarize(p2_with_collab_start = sum(collab_dummy))
+
+p2_with_collab_end = trial_firm_detail_3 %>%  
+  filter(phase_2 == 1) %>% 
+  mutate(collab_dummy = ifelse(collab_num == 0, 0, 1)) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarize(p2_with_collab_end = sum(collab_dummy))
+
+p2_trial_with_collab_avtive = firm_year_dataset_9 %>% 
+  left_join(p2_with_collab_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_with_collab_end, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(across(everything(), ~ replace_na(., 0)),
+         cum_p2_with_collab_start = cumsum(p2_with_collab_start),
+         cum_p2_with_collab_end = lag(cumsum(p2_with_collab_end), default = 0),
+         p2_trial_with_collab_avtive = cum_p2_with_collab_start - cum_p2_with_collab_end) %>% 
+  select(sponsor_id, year, p2_trial_with_collab_avtive)
+
+
+
+
+  
+# Add these 13 columns to the firm_year_dataset
+firm_year_dataset_10 = firm_year_dataset_9 %>% 
+  left_join(allphase_collab, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  left_join(p2_collab, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  left_join(p2_industry_collab, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  left_join(p2_non_industry_collab, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  left_join(p2_trial_with_collab_avtive, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>%
+  mutate(across(everything(), ~ replace_na(., 0))) 
+
+```
+
+##### Add covid
+
+  Here we want to keep track of the numbers of phase 2 trials that are covid related:
+  
+  p2_covid_start and p2_covid_active for each firm_year
+
+```{r}
+# Create variable p2_trial_with_collab
+p2_covid_start = trial_firm_detail_3 %>%  
+  filter(phase_2 == 1) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarize(p2_covid_start = sum(covid))
+
+p2_covid_end = trial_firm_detail_3 %>%  
+  filter(phase_2 == 1) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarize(p2_covid_end = sum(covid))
+
+p2_covid = firm_year_dataset_10 %>% 
+  left_join(p2_covid_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_covid_end, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(across(everything(), ~ replace_na(., 0)),
+         cum_p2_covid_start = cumsum(p2_covid_start),
+         cum_p2_covid_end = lag(cumsum(p2_covid_end), default = 0),
+         p2_covid_avtive = cum_p2_covid_start - cum_p2_covid_end) %>% 
+  select(sponsor_id, year, p2_covid_start, p2_covid_avtive)
+
+
+
+firm_year_dataset_11 = firm_year_dataset_10 %>% 
+  left_join(p2_covid, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>%
+  mutate(across(everything(), ~ replace_na(., 0))) 
+```
+
+##### Add disease 
+
+  Here we want to investigate the measure of different types of diseases, we will first classify diseases in the trial_firm_detail dataset in numerous ways and then count them in the firm_year_dataset.
+  
+  Utilize the disease_id_code_name table built from section /Clean Variables/disease
+  
+  We are interested in:
+   - p2_unique_disease_ongoing
+   
+   - p2_cancer_ongoing
+   
+   - # of phase 2 trials in Diseases with low vs. high number patients
+    - pre_2010, and pre_2018
+    
+   - # of phase 2 trials in Diseases with short vs. long lengths (from trial start to trial completion date)
+    - pre_2010, and pre_2018
+    
+   - average/median/max/min p2 length of the trial for each company/year
+   
+   - # of phase 2 trials in Diseases with low costs and high costs in phase 2 costs
+   
+   - Average cost of phase 2 trials
+
+
+```{r}
+# p2_unique_disease_ongoing
+p2_disease_start = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(disease_id != "") %>% 
+  select(sponsor_id, start_year, disease_id) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(p2_all_disease_start_list = str_c(disease_id, collapse = ", "))
+p2_disease_end = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(disease_id != "") %>% 
+  select(sponsor_id, end_year, disease_id) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(p2_all_disease_end_list = str_c(disease_id, collapse = ", "))
+
+p2_unique_disease_ongoing = firm_year_dataset_11 %>% 
+  left_join(p2_disease_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_disease_end, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  select(sponsor_id, year, p2_all_disease_start_list, p2_all_disease_end_list) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(p2_all_disease_start_list = ifelse(is.na(p2_all_disease_start_list), "", p2_all_disease_start_list)) %>%
+  mutate(p2_all_disease_end_list = ifelse(is.na(p2_all_disease_end_list), "", p2_all_disease_end_list)) %>% 
+  mutate(cum_p2_all_disease_start_list = accumulate(
+      p2_all_disease_start_list, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", "))) %>% 
+  mutate(cum_p2_all_disease_end_list = lag(accumulate(
+      p2_all_disease_end_list, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")), default = "")) %>% 
+  rowwise() %>% 
+  mutate(
+    p2_unique_disease_ongoing_list = preserve_setdiff(str_split(cum_p2_all_disease_start_list, ", ")[[1]], 
+                                                    str_split(cum_p2_all_disease_end_list, ", ")[[1]]) %>% 
+      paste(collapse = ", "),
+    p2_unique_disease_ongoing = p2_unique_disease_ongoing_list %>% str_split(", ") %>% map_int(~ length(unique(.x))),
+    p2_unique_disease_ongoing = ifelse(p2_unique_disease_ongoing_list == "", 0, p2_unique_disease_ongoing)
+    ) %>% 
+  ungroup() %>% 
+  select(sponsor_id, year, p2_unique_disease_ongoing)
+  
+
+
+
+# p2_cancer_ongoing
+# Note that Cancer(C04) has disease_id = 4
+p2_cancer_start = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(disease_id == 4) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(p2_cancer_start = n())
+p2_cancer_end = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(disease_id == 4) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(p2_cancer_end = n())
+
+p2_cancer_ongoing = firm_year_dataset_11 %>% 
+  left_join(p2_cancer_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_cancer_end, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  select(sponsor_id, year, p2_cancer_start, p2_cancer_end) %>% 
+  mutate(across(everything(), ~ replace_na(., 0))) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(cum_p2_cancer_start = cumsum(p2_cancer_start),
+         cum_p2_cancer_end = lag(cumsum(p2_cancer_end), default = 0),
+         p2_cancer_ongoing = cum_p2_cancer_start - cum_p2_cancer_end) %>% 
+  select(sponsor_id, year, p2_cancer_ongoing)
+
+
+
+
+# p2_high_patnum_pre2010_ongoing, p2_low_patnum_pre2010_ongoing, p2_long_length_pre2010_ongoing, p2_short_length_pre2010_ongoing 
+p2_trial_pre2010 = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(disease_id != "") %>% 
+  filter(end_year != "") %>% 
+  filter(end_year <= 2010) %>% 
+  filter(patient_num != "") %>% 
+  mutate(patient_num = as.numeric(patient_num),
+         start_year = as.numeric(start_year),
+         end_year = as.numeric(end_year),
+         trial_length = end_year - start_year) %>% 
+  select(trial_id, sponsor_id, disease_id, start_year, end_year, patient_num, trial_length)
+
+p2_patnum_length_pre2010 = p2_trial_pre2010 %>% 
+  group_by(disease_id) %>% 
+  summarize(disease_mean_patnum = mean(patient_num),
+            disease_mean_length = mean(trial_length)) %>% 
+  ungroup() %>% 
+  mutate(p2_high_patnum_pre2010 = ifelse(disease_mean_patnum > median(disease_mean_patnum), 1, 0),
+         p2_low_patnum_pre2010 = ifelse(p2_high_patnum_pre2010 == 1, 0, 1),
+         p2_long_length_pre2010 = ifelse(disease_mean_length > median(disease_mean_length), 1, 0),
+         p2_short_length_pre2010 = ifelse(p2_long_length_pre2010 == 1, 0, 1)) %>% 
+  select(disease_id, p2_high_patnum_pre2010, p2_low_patnum_pre2010, p2_long_length_pre2010, p2_short_length_pre2010)
+
+p2_trial_patnum_length_pre2010 = p2_trial_pre2010 %>% 
+  left_join(p2_patnum_length_pre2010, by = "disease_id") %>% 
+  select(sponsor_id, start_year, end_year, p2_high_patnum_pre2010, p2_low_patnum_pre2010, p2_long_length_pre2010, p2_short_length_pre2010)
+
+p2_trial_patnum_length_pre2010_start = p2_trial_patnum_length_pre2010 %>% 
+  mutate(start_year = as.character(start_year)) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(p2_high_patnum_pre2010_start = sum(p2_high_patnum_pre2010),
+            p2_low_patnum_pre2010_start = sum(p2_low_patnum_pre2010),
+            p2_long_length_pre2010_start = sum(p2_long_length_pre2010),
+            p2_short_length_pre2010_start = sum(p2_short_length_pre2010))
+  
+p2_trial_patnum_length_pre2010_end = p2_trial_patnum_length_pre2010 %>% 
+  mutate(end_year = as.character(end_year)) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(p2_high_patnum_pre2010_end = sum(p2_high_patnum_pre2010),
+            p2_low_patnum_pre2010_end = sum(p2_low_patnum_pre2010),
+            p2_long_length_pre2010_end = sum(p2_long_length_pre2010),
+            p2_short_length_pre2010_end = sum(p2_short_length_pre2010))
+
+p2_trial_patnum_length_pre2010_ongoing = firm_year_dataset_11 %>% 
+  left_join(p2_trial_patnum_length_pre2010_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_trial_patnum_length_pre2010_end, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  select(sponsor_id, year, p2_high_patnum_pre2010_start, p2_high_patnum_pre2010_end, p2_low_patnum_pre2010_start, p2_low_patnum_pre2010_end, p2_long_length_pre2010_start, p2_long_length_pre2010_end, p2_short_length_pre2010_start, p2_short_length_pre2010_end) %>% 
+  mutate(across(everything(), ~ replace_na(., 0))) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(cum_p2_high_patnum_pre2010_start = cumsum(p2_high_patnum_pre2010_start),
+         cum_p2_high_patnum_pre2010_end = lag(cumsum(p2_high_patnum_pre2010_end), default = 0),
+         cum_p2_low_patnum_pre2010_start = cumsum(p2_low_patnum_pre2010_start),
+         cum_p2_low_patnum_pre2010_end = lag(cumsum(p2_low_patnum_pre2010_end), default = 0),
+         cum_p2_long_length_pre2010_start = cumsum(p2_long_length_pre2010_start),
+         cum_p2_long_length_pre2010_end = lag(cumsum(p2_long_length_pre2010_end), default = 0),
+         cum_p2_short_length_pre2010_start = cumsum(p2_short_length_pre2010_start),
+         cum_p2_short_length_pre2010_end = lag(cumsum(p2_short_length_pre2010_end), default = 0),
+         p2_high_patnum_pre2010_ongoing = cum_p2_high_patnum_pre2010_start - cum_p2_high_patnum_pre2010_end,
+         p2_low_patnum_pre2010_ongoing = cum_p2_low_patnum_pre2010_start - cum_p2_low_patnum_pre2010_end,
+         p2_long_length_pre2010_ongoing = cum_p2_long_length_pre2010_start - cum_p2_long_length_pre2010_end,
+         p2_short_length_pre2010_ongoing = cum_p2_short_length_pre2010_start - cum_p2_short_length_pre2010_end,) %>% 
+  select(sponsor_id, year, p2_high_patnum_pre2010_ongoing, p2_low_patnum_pre2010_ongoing, p2_long_length_pre2010_ongoing, p2_short_length_pre2010_ongoing)
+
+
+
+
+# Do again for 2018 cutoff
+# p2_high_patnum_pre2018_ongoing, p2_low_patnum_pre2018_ongoing, p2_long_length_pre2018_ongoing, p2_short_length_pre2018_ongoing 
+p2_trial_pre2018 = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  filter(disease_id != "") %>% 
+  filter(end_year != "") %>% 
+  filter(end_year <= 2018) %>% 
+  filter(patient_num != "") %>% 
+  mutate(patient_num = as.numeric(patient_num),
+         start_year = as.numeric(start_year),
+         end_year = as.numeric(end_year),
+         trial_length = end_year - start_year) %>% 
+  select(trial_id, sponsor_id, disease_id, start_year, end_year, patient_num, trial_length)
+
+p2_patnum_length_pre2018 = p2_trial_pre2018 %>% 
+  group_by(disease_id) %>% 
+  summarize(disease_mean_patnum = mean(patient_num),
+            disease_mean_length = mean(trial_length)) %>% 
+  ungroup() %>% 
+  mutate(p2_high_patnum_pre2018 = ifelse(disease_mean_patnum > median(disease_mean_patnum), 1, 0),
+         p2_low_patnum_pre2018 = ifelse(p2_high_patnum_pre2018 == 1, 0, 1),
+         p2_long_length_pre2018 = ifelse(disease_mean_length > median(disease_mean_length), 1, 0),
+         p2_short_length_pre2018 = ifelse(p2_long_length_pre2018 == 1, 0, 1)) %>% 
+  select(disease_id, p2_high_patnum_pre2018, p2_low_patnum_pre2018, p2_long_length_pre2018, p2_short_length_pre2018)
+
+p2_trial_patnum_length_pre2018 = p2_trial_pre2018 %>% 
+  left_join(p2_patnum_length_pre2018, by = "disease_id") %>% 
+  select(sponsor_id, start_year, end_year, p2_high_patnum_pre2018, p2_low_patnum_pre2018, p2_long_length_pre2018, p2_short_length_pre2018)
+
+p2_trial_patnum_length_pre2018_start = p2_trial_patnum_length_pre2018 %>% 
+  mutate(start_year = as.character(start_year)) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(p2_high_patnum_pre2018_start = sum(p2_high_patnum_pre2018),
+            p2_low_patnum_pre2018_start = sum(p2_low_patnum_pre2018),
+            p2_long_length_pre2018_start = sum(p2_long_length_pre2018),
+            p2_short_length_pre2018_start = sum(p2_short_length_pre2018))
+  
+p2_trial_patnum_length_pre2018_end = p2_trial_patnum_length_pre2018 %>% 
+  mutate(end_year = as.character(end_year)) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(p2_high_patnum_pre2018_end = sum(p2_high_patnum_pre2018),
+            p2_low_patnum_pre2018_end = sum(p2_low_patnum_pre2018),
+            p2_long_length_pre2018_end = sum(p2_long_length_pre2018),
+            p2_short_length_pre2018_end = sum(p2_short_length_pre2018))
+
+p2_trial_patnum_length_pre2018_ongoing = firm_year_dataset_11 %>% 
+  left_join(p2_trial_patnum_length_pre2018_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_trial_patnum_length_pre2018_end, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  select(sponsor_id, year, p2_high_patnum_pre2018_start, p2_high_patnum_pre2018_end, p2_low_patnum_pre2018_start, p2_low_patnum_pre2018_end, p2_long_length_pre2018_start, p2_long_length_pre2018_end, p2_short_length_pre2018_start, p2_short_length_pre2018_end) %>% 
+  mutate(across(everything(), ~ replace_na(., 0))) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(cum_p2_high_patnum_pre2018_start = cumsum(p2_high_patnum_pre2018_start),
+         cum_p2_high_patnum_pre2018_end = lag(cumsum(p2_high_patnum_pre2018_end), default = 0),
+         cum_p2_low_patnum_pre2018_start = cumsum(p2_low_patnum_pre2018_start),
+         cum_p2_low_patnum_pre2018_end = lag(cumsum(p2_low_patnum_pre2018_end), default = 0),
+         cum_p2_long_length_pre2018_start = cumsum(p2_long_length_pre2018_start),
+         cum_p2_long_length_pre2018_end = lag(cumsum(p2_long_length_pre2018_end), default = 0),
+         cum_p2_short_length_pre2018_start = cumsum(p2_short_length_pre2018_start),
+         cum_p2_short_length_pre2018_end = lag(cumsum(p2_short_length_pre2018_end), default = 0),
+         p2_high_patnum_pre2018_ongoing = cum_p2_high_patnum_pre2018_start - cum_p2_high_patnum_pre2018_end,
+         p2_low_patnum_pre2018_ongoing = cum_p2_low_patnum_pre2018_start - cum_p2_low_patnum_pre2018_end,
+         p2_long_length_pre2018_ongoing = cum_p2_long_length_pre2018_start - cum_p2_long_length_pre2018_end,
+         p2_short_length_pre2018_ongoing = cum_p2_short_length_pre2018_start - cum_p2_short_length_pre2018_end,) %>% 
+  select(sponsor_id, year, p2_high_patnum_pre2018_ongoing, p2_low_patnum_pre2018_ongoing, p2_long_length_pre2018_ongoing, p2_short_length_pre2018_ongoing)
+
+
+
+
+# p2_average/median/max/min_length 
+p2_trial_length = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>%
+  filter(end_year != "") %>% 
+  mutate(start_year = as.numeric(start_year),
+         end_year = as.numeric(end_year),
+         trial_length = end_year - start_year) %>% 
+  select(trial_id, sponsor_id, start_year, end_year, trial_length)
+
+p2_trial_length_start = p2_trial_length %>% 
+  mutate(start_year = as.character(start_year)) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(p2_trial_length_start = str_c(trial_length, collapse = ", "))
+
+p2_trial_length_end = p2_trial_length %>% 
+  mutate(end_year = as.character(end_year)) %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(p2_trial_length_end = str_c(trial_length, collapse = ", "))
+
+p2_average_median_max_min_length = firm_year_dataset_11 %>% 
+  left_join(p2_trial_length_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_trial_length_end, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  select(sponsor_id, year, p2_trial_length_start, p2_trial_length_end) %>% 
+  mutate(across(everything(), ~ replace_na(., ""))) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(cum_p2_trial_length_start = accumulate(
+      p2_trial_length_start, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")),
+         cum_p2_trial_length_end = lag(accumulate(
+      p2_trial_length_end, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")), default = "")) %>% 
+  rowwise() %>% 
+  mutate(
+    p2_trial_length_active = ifelse(length(preserve_setdiff(str_split(cum_p2_trial_length_start, ", ")[[1]],
+                                              str_split(cum_p2_trial_length_end, ", ")[[1]])) == 0, NA,
+                                    preserve_setdiff(str_split(cum_p2_trial_length_start, ", ")[[1]],
+                                              str_split(cum_p2_trial_length_end, ", ")[[1]]) %>% paste(collapse = ", ")),
+    p2_mean_length = mean(as.numeric(str_split(p2_trial_length_active, ", ")[[1]])),
+    p2_median_length = median(as.numeric(str_split(p2_trial_length_active, ", ")[[1]])),
+    p2_max_length = max(as.numeric(str_split(p2_trial_length_active, ", ")[[1]])),
+    p2_min_length = min(as.numeric(str_split(p2_trial_length_active, ", ")[[1]]))
+  ) %>% 
+  select(sponsor_id, year, p2_mean_length, p2_median_length, p2_max_length, p2_min_length)
+
+p2_average_median_max_min_length = p2_average_median_max_min_length %>% 
+  mutate(p2_mean_length = ifelse(is.na(p2_mean_length), "", as.character(p2_mean_length)),
+         p2_median_length = ifelse(is.na(p2_median_length), "", as.character(p2_median_length)),
+         p2_max_length = ifelse(is.na(p2_max_length), "", as.character(p2_max_length)),
+         p2_min_length = ifelse(is.na(p2_min_length), "", as.character(p2_min_length))
+         )
+
+
+
+
+
+
+# Create a mapping list from disease code to class and cost first
+disease_code_cat = read_csv("disease/Disease_Categorization_by_R_D_Cost.csv")
+disease_cat_cost = data_frame(
+  category = c("Anti-Infective", "Oncology", "Other", "Gastrointestinal", "Respiratory System", "Central Nervous System", "Ophthalmology", "Cardiovascular", "Dermatology", "Endocrine", "Immunomodulation", "Pain and Anesthesia", "Genitourinary System"),
+  class = c("mid", "mid", "", "high", "mid", "mid", "mid", "low", "low", "mid", "high", "high", "mid"),
+  cost = c(14.2, 11.2, 0, 15.8, 12.2, 13.9, 13.8, 7, 8.9, 12.1, 16, 17,14.6)
+)
+disease_code_class_cost= disease_code_cat %>% 
+  left_join(disease_cat_cost) %>% 
+  mutate(disease_id = as.character(disease_id)) %>% 
+  select(disease_id, class, cost)
+
+
+
+
+# p2_highcost_ongoing, p2_midcost_ongoing, p2_lowcost_ongoing
+p2_cost_class = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  left_join(disease_code_class_cost, by = "disease_id") %>% 
+  mutate(highcost = ifelse(class == "high", 1, 0),
+         midcost = ifelse(class == "mid", 1, 0),
+         lowcost = ifelse(class == "low", 1, 0)) %>% 
+  select(trial_id, sponsor_id, start_year, end_year, disease_id, highcost, midcost, lowcost) %>% 
+  mutate(across(everything(), ~ replace_na(., 0))) 
+
+p2_cost_class_start = p2_cost_class %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarize(highcost_start = sum(highcost),
+            midcost_start = sum(midcost),
+            lowcost_start = sum(lowcost))
+
+p2_cost_class_end = p2_cost_class %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarize(highcost_end= sum(highcost),
+            midcost_end = sum(midcost),
+            lowcost_end = sum(lowcost))
+
+p2_cost_class_ongoing = firm_year_dataset_11 %>% 
+  left_join(p2_cost_class_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_cost_class_end, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  select(sponsor_id, year, highcost_start, highcost_end, midcost_start, midcost_end, lowcost_start, lowcost_end) %>% 
+  mutate(across(everything(), ~ replace_na(., 0))) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(
+    cum_highcost_start = cumsum(highcost_start),
+    cum_highcost_end = lag(cumsum(highcost_end), default = 0),
+    cum_midcost_start = cumsum(midcost_start),
+    cum_midcost_end = lag(cumsum(midcost_end), default = 0),
+    cum_lowcost_start = cumsum(lowcost_start),
+    cum_lowcost_end = lag(cumsum(lowcost_end), default = 0),
+    p2_highcost_ongoing = cum_highcost_start - cum_highcost_end,
+    p2_midcost_ongoing = cum_midcost_start - cum_midcost_end,
+    p2_lowcost_ongoing = cum_lowcost_start - cum_lowcost_end
+  ) %>% 
+  ungroup() %>% 
+  select(sponsor_id, year, p2_highcost_ongoing, p2_midcost_ongoing, p2_lowcost_ongoing)
+
+
+
+
+# p2_mean_cost
+p2_cost = trial_firm_detail_3 %>% 
+  filter(phase_2 == 1) %>% 
+  left_join(disease_code_class_cost, by = "disease_id") %>% 
+  select(trial_id, sponsor_id, start_year, end_year, disease_id, cost) %>% 
+  mutate(cost = ifelse(is.na(cost), 0, cost))
+
+p2_cost_start = p2_cost %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarise(p2_cost_start = str_c(cost, collapse = ", "))
+
+p2_cost_end = p2_cost %>% 
+  group_by(sponsor_id, end_year) %>% 
+  summarise(p2_cost_end = str_c(cost, collapse = ", "))
+
+p2_mean_cost = firm_year_dataset_11 %>% 
+  left_join(p2_cost_start, by = c("sponsor_id" = "sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_cost_end, by = c("sponsor_id" = "sponsor_id", "year" = "end_year")) %>% 
+  select(sponsor_id, year, p2_cost_start, p2_cost_end) %>% 
+  mutate(across(everything(), ~ replace_na(., ""))) %>% 
+  group_by(sponsor_id) %>% 
+  mutate(cum_p2_cost_start = accumulate(
+      p2_cost_start, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")),
+         cum_p2_cost_end = lag(accumulate(
+      p2_cost_end, ~ (c(.x[.x != "" & !is.na(.x)], .y[.y != "" & !is.na(.y)]))
+      ) %>% map_chr(~ paste(.x, collapse = ", ")), default = "")) %>% 
+  rowwise() %>% 
+  mutate(
+    p2_cost_active = ifelse(length(preserve_setdiff(str_split(cum_p2_cost_start, ", ")[[1]],
+                                              str_split(cum_p2_cost_end, ", ")[[1]])) == 0, NA,
+                                    preserve_setdiff(str_split(cum_p2_cost_start, ", ")[[1]],
+                                              str_split(cum_p2_cost_end, ", ")[[1]]) %>% paste(collapse = ", ")),
+    p2_mean_cost = mean(as.numeric(str_split(p2_cost_active, ", ")[[1]])),
+    p2_mean_cost_without_other = mean(as.numeric(str_split(p2_cost_active, ", ")[[1]])[as.numeric(str_split(p2_cost_active, ", ")[[1]]) != 0])
+  ) %>% 
+  select(sponsor_id, year, p2_mean_cost, p2_mean_cost_without_other) %>% 
+  mutate(across(everything(), ~ replace_na(., 0))) 
+
+
+
+# Add these 13 columns to the dataset
+firm_year_dataset_12 = firm_year_dataset_11 %>% 
+  left_join(p2_unique_disease_ongoing, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  left_join(p2_cancer_ongoing, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  left_join(p2_trial_patnum_length_pre2010_ongoing, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  left_join(p2_trial_patnum_length_pre2018_ongoing, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  left_join(p2_average_median_max_min_length, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  left_join(p2_cost_class_ongoing, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  left_join(p2_mean_cost, by = c("sponsor_id" = "sponsor_id", "year" = "year")) %>% 
+  mutate(across(everything(), ~ replace_na(., 0))) 
+
+```
+
+
+  Comments & Observations: 
+   - For variables related to diseases, trials missing disease_id were not counted.
+   - For variables related to patient_num, trials missing patient_num were not counted.
+   - After filtering (phase_2 == 1, end_year<2010, patient_num != ""), we have 18729 trials left, with 29 diseases.
+   - For p2_average/median/max/min_length, I only counted for the completed (or terminated) ones. 
+   - For p2_mean_cost, since excess amount of "Other" class of disease (which have cost 0) will drag down the average cost of trials, I created a p2_mean_cost, and p2_mean_cost_without_other, which calculate average cost excluding the "Other" type of diseases.
+
+
+
+
+  
   
   
 ```{r}
 # Exploratory code
+
+
+
 ```
 
 
 ```{r}
 # Sanity Check
 # Unique sposnor_ids 23557
-# N for firm_year 319750
+# N for firm_year 319741
 
 ```
 
@@ -2237,9 +3055,9 @@ write.csv(trial_disease_firm_dataset, file = "trial_disease_firm_dataset.csv")
 # Create csv files with unique company_id and unique country names and id
 write.csv(trial_firm_detail_3, file = "trial_firm_detail_3.csv")
 write.csv(firm_name_founding_year_id, file = "firm_name_founding_year_id.csv")
-write.csv(firm_year_dataset_9, file = "firm_year_dataset_11212024.csv")
+write.csv(firm_year_dataset_12, file = "firm_year_dataset_12112024.csv")
 
-write.csv(unmatched_sponsor_names, file = "unmatched_sponsor_names.csv")
+write.csv(disease_id_code_name, file = "disease_id_code_name.csv")
 ```
 
 **Report to Sukhun:  sponsor_id_foundedyear_firsttrialyear and firm_year_dataset_11182024**
