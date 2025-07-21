@@ -6954,7 +6954,63 @@ firm_year_dataset_30 = firm_year_dataset_29 %>%
 
  
  
- 
+##### Add trans to phase 3
+
+  We want a measure of collab quality, which we think can be determined by if the trials progressed to phase 3 trial or not. Since this is not trivial from the nct_id, we use hte following logic to determine if a phase 2 trial has a phase 3 counterpart.
+  
+A p2 trial has value 1 for p2_trans_p3 when:
+  - The trial status is "completed" (not terminated) with a valid end year
+  - there is a phase 3 trial following the following criteria:
+    - same sponsor_id
+    - phase 3 start_year >= phase 2 end_year
+    - same tree 2 level disease code
+    
+We will name this variable p2_start_trans_p3, which marks the start of p2 trials which ultimately transiitoned to phase 3.
+Additionally, we also want to create p2_start_trans_p3_w_collab, which marks those successful trasnfering with collaborators.
+
+Note: Since we only have tree 2 level disease code for AACT data, this variable is only reflective to the AACT data.
+Note: Out of the 150988 p2 trials, 44381 (29.4%) transitioned to phase 3 under our algorithm
+Note: All p2 trial with a valid p3 counterpart will have 1 for p2_trans_p3, even if p3 trials are less than p2 trials (the p3 trial can be the sequence of any qualifying p2 trials) 
+  
+  
+```{r}
+# Create the variable p2_trans_p3
+trial_firm_detail_trans_p3 <- trial_firm_detail_tree2 %>%
+  filter(!is.na(disease_code_tree2)) %>% 
+  group_by(sponsor_id, disease_code_tree2) %>%
+  mutate(
+    p2_trans_p3 = case_when(
+      phase_2 == 0 ~ 0,  # Not a phase 2 trial
+      phase_2 == 1 & (status != "completed" | is.na(end_year)) ~ 0,  # Phase 2 but not completed or missing end_year
+      phase_2 == 1 & status == "completed" & !is.na(end_year) ~ {
+        # Within each sponsor_id + disease_code_tree2 group, check for phase 3 trials
+        p3_start_years <- start_year[phase_3 == 1 & !is.na(start_year)]
+        as.numeric(any(p3_start_years >= end_year))
+      },
+      TRUE ~ 0
+    )
+  ) %>%
+  ungroup()
+
+# p2_start_trans_p3
+p2_start_trans_p3 = trial_firm_detail_trans_p3 %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarize(p2_start_trans_p3 = sum(p2_trans_p3))
+
+# p2_start_trans_p3_w_collab
+p2_start_trans_p3_w_collab = trial_firm_detail_trans_p3 %>% 
+  filter(collab_num > 0) %>% 
+  group_by(sponsor_id, start_year) %>% 
+  summarize(p2_start_trans_p3_w_collab = sum(p2_trans_p3))
+
+# Add these 2 variables to the firm year panel
+firm_year_dataset_31 = firm_year_dataset_30 %>% 
+  left_join(p2_start_trans_p3, by = c("sponsor_id", "year" = "start_year")) %>% 
+  left_join(p2_start_trans_p3_w_collab, by = c("sponsor_id", "year" = "start_year")) %>% 
+  mutate(across(everything(), ~ replace_na(., 0)))
+
+```
+
  
  
 
@@ -7478,6 +7534,7 @@ trial_firm_detail_3 %>%
          phase_2 == 1,
          source == "EU",
          collab_num >= 2) 
+
 
 ```
 
@@ -8793,7 +8850,7 @@ Collab:
 # Create csv files with unique company_id and unique country names and id
 write.csv(trial_firm_detail_3, file = "trial_firm_detail_3.csv")
 write.csv(firm_name_founding_year_id, file = "firm_name_founding_year_id.csv")
-write.csv(firm_year_dataset_29, file = "firm_year_dataset_06082025.csv")
+write.csv(firm_year_dataset_31, file = "firm_year_dataset_07142025.csv")
 
 
 write.csv(unmatched_collaborators, file = "unmatched_collaborators.csv")
@@ -8850,6 +8907,22 @@ In short, p2_start_w_eu_collab are measuring industry collaborators, so having p
 
 p2_similar_exp_all_phase_collab:
 Done. Note that since we only have level 2 mesh code for AACT trials, and seeing the experience of level 1 is not good enough resolution. So we would only be focusing on the AACT trials with level 2 mesh codes here. *6 hr*
+
+
+Hand over the projec to Sean: *4 hr*
+
+
+p2_start_trans_p3 and p2_start_trans_p3_w_collab:
+A p2 trial has value 1 for p2_trans_p3 when:
+  - The trial status is "completed" (not terminated) with a valid end year
+  - there is a phase 3 trial following the following criteria:
+    - same sponsor_id
+    - phase 3 start_year >= phase 2 end_year
+    - same tree 2 level disease code
+
+Note: Since we only have tree 2 level disease code for AACT data, this variable is only reflective to the AACT data.
+Note: Out of the 150988 p2 trials, 62757 (41.6%) transitioned to phase 3 under our algorithm
+Note: All p2 trial with a valid p3 counterpart will have 1 for p2_trans_p3, even if p3 trials are less than p2 trials (the p3 trial can be the sequence of any qualifying p2 trials) *5 hr*
 
  
 
